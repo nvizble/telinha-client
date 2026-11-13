@@ -1,0 +1,39 @@
+[package]
+name = "telinha"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license-file.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-channel = "2"
+cpal = "0.16"
+futures-util = "0.3"
+# macOS uses NoopTextSystem without font-kit: layout works but all text is invisible.
+gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "windows-manifest", "runtime_shaders"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+livekit = { version = "=0.10.1", features = ["rustls-tls-native-roots"] }
+# Decode MJPEG with image's Rust decoder; mozjpeg exports symbols also in WebRTC.
+nokhwa = { version = "=0.10.11", default-features = false }
+parking_lot = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+serde.workspace = true
+serde_json.workspace = true
+telinha-shared.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+nokhwa = { version = "=0.10.11", default-features = false, features = ["input-msmf"] }
+wasapi = "=0.27.0"
+winreg = "0.55"
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading"] }
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+embed-resource = "3"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+

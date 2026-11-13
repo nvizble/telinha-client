@@ -1,0 +1,24 @@
+[package]
+name = "telinha-shared"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license-file.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64 = "0.22"
+ring = "0.17"
+semver = "1"
+serde_json.workspace = true
+sha2 = "0.10"
+rand = "0.8"
+serde.workspace = true
+thiserror = "2"
+url = "2"
+p256 = { version = "0.13.2", default-features = false, features = ["ecdh", "std"] }
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+

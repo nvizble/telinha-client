@@ -1,0 +1,22 @@
+{
+  "note": "PUBLIC TEST VECTOR ONLY. Fixed synthetic keys must never be used in real sessions.",
+  "room": "k7f2qxmn3dpa",
+  "sender": {
+    "identity": "alice",
+    "publicKey": "BG_wO5SSQc4drdQ1GeaWDgqFtBppoFwygQOqK84VlMoWPE91OlW_AdxT9sCwx-7ni0DG_30lqW4igrmJzvccFEo",
+    "privateTestOnly": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"
+  },
+  "recipient": {
+    "identity": "bob",
+    "publicKey": "BFUPRxAD89-Xw99QaseX9nIfsaH7e49vg9IkSYplyI4kE2CT1wEuUJpzcVy9CwCjzA_0tcAbP_oZarH7MnA2uOY",
+    "privateTestOnly": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"
+  },
+  "mediaKeyTestOnly": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+  "envelope": {
+    "sender": "alice",
+    "recipient": "bob",
+    "generation": 7,
+    "nonce": "JleoH7fw3fmlAnAc",
+    "ciphertext": "dXnWhotSYkYGH9-qEj6Ml_kAt6T9KleSfU5FM8DZaL2q7LZoTl-_2JlMCI4lG2VQ"
+  }
+}
