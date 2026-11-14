@@ -19,6 +19,37 @@ use telinha_shared::{
     },
 };
 
+// Stop before the relay's 30-second membership lease expires. Short HTTP
+// failures must not tear down healthy encrypted WebRTC media.
+const MAX_RELAY_GAP: Duration = Duration::from_secs(20);
+
+fn transient(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
+        .is_some_and(|error| match error.status() {
+            Some(status) => status.is_server_error() || matches!(status.as_u16(), 408 | 429),
+            None => !error.is_builder() && !error.is_redirect() && !error.is_decode(),
+        })
+}
+
+fn failure_category(error: &anyhow::Error) -> &'static str {
+    if let Some(error) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
+    {
+        match error.status().map(|status| status.as_u16()) {
+            Some(401 | 403) => "authorization_revoked",
+            Some(429) => "rate_limited",
+            Some(_) => "http_error",
+            None if error.is_timeout() => "timeout",
+            None => "transport_error",
+        }
+    } else {
+        "invalid_encryption_state"
+    }
+}
+
 pub struct Session {
     identity: Identity,
     me: Peer,
@@ -30,10 +61,12 @@ pub struct Session {
     sent: HashMap<String, u32>,
     received: HashMap<String, u32>,
     pending: HashMap<String, Instant>,
+    pending_warned: HashSet<String>,
     retired: HashSet<String>,
     client: reqwest::Client,
     endpoint: String,
     token: String,
+    last_poll: Instant,
 }
 
 impl Session {
@@ -78,6 +111,7 @@ impl Session {
             sent: HashMap::new(),
             received: HashMap::new(),
             pending: HashMap::new(),
+            pending_warned: HashSet::new(),
             retired: HashSet::new(),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(6))
@@ -85,6 +119,7 @@ impl Session {
                 .build()?,
             endpoint: format!("{}/e2ee", server.trim_end_matches('/')),
             token: relay.token,
+            last_poll: Instant::now(),
         })
     }
 
@@ -98,13 +133,42 @@ impl Session {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut failures = 0u32;
         loop {
-            tick.tick().await;
-            self.exchange()
-                .await
-                .context("A troca segura de chaves foi interrompida.")?;
+            let delay = match self.exchange().await {
+                Ok(()) => {
+                    if failures > 0 {
+                        tracing::info!(
+                            event = "e2ee_recovered",
+                            attempts = failures,
+                            "Troca de chaves recuperada"
+                        );
+                    }
+                    failures = 0;
+                    Duration::from_secs(1)
+                }
+                Err(error) if transient(&error) && self.last_poll.elapsed() < MAX_RELAY_GAP => {
+                    failures = failures.saturating_add(1);
+                    tracing::warn!(
+                        event = "e2ee_retry",
+                        reason = failure_category(&error),
+                        attempt = failures,
+                        "Falha transitória na troca de chaves; tentando novamente"
+                    );
+                    Duration::from_secs(1 << (failures - 1).min(2))
+                        .min(MAX_RELAY_GAP.saturating_sub(self.last_poll.elapsed()))
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        event = "e2ee_stopped",
+                        reason = failure_category(&error),
+                        relay_gap_seconds = self.last_poll.elapsed().as_secs(),
+                        "A troca de chaves não pôde ser mantida"
+                    );
+                    return Err(error).context("A troca segura de chaves foi interrompida.");
+                }
+            };
+            tokio::time::sleep(delay).await;
         }
     }
 
@@ -141,6 +205,7 @@ impl Session {
                 && state.envelopes.len() < MAX_PEERS,
             "Incompatible key relay response"
         );
+        self.last_poll = Instant::now();
         let mut peers = HashMap::new();
         for peer in state.peers {
             ensure!(
@@ -203,6 +268,7 @@ impl Session {
         }
         self.sent.retain(|id, _| peers.contains_key(id));
         self.pending.retain(|id, _| peers.contains_key(id));
+        self.pending_warned.retain(|id| peers.contains_key(id));
         self.peers = peers;
         for envelope in state.envelopes {
             let Some(sender) = self.peers.get(&envelope.sender) else {
@@ -227,14 +293,27 @@ impl Session {
                 "Media key installation failed"
             );
             self.pending.remove(&envelope.sender);
+            self.pending_warned.remove(&envelope.sender);
             self.received.insert(envelope.sender, envelope.generation);
         }
-        ensure!(
-            self.pending
-                .values()
-                .all(|since| since.elapsed() < Duration::from_secs(30)),
-            "A participant did not complete encrypted key exchange"
-        );
+        let delayed: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(id, since)| {
+                since.elapsed() >= Duration::from_secs(30) && !self.pending_warned.contains(*id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        if !delayed.is_empty() {
+            // Missing keys block only that publisher's encrypted media. One
+            // stalled participant must not disconnect everybody else.
+            tracing::warn!(
+                event = "e2ee_peer_key_delayed",
+                peers = delayed.len(),
+                "Aguardando chaves de participantes"
+            );
+            self.pending_warned.extend(delayed);
+        }
         let mut outgoing = Vec::new();
         for recipient in self.peers.values() {
             if self.sent.get(&recipient.identity) == Some(&self.generation) {
@@ -279,3 +358,6 @@ impl Session {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

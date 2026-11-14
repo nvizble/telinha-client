@@ -62,6 +62,7 @@ pub enum Event {
         image: Option<image::RgbaImage>,
     },
     StreamAdded(RemoteStream),
+    StreamPaused(String),
     StreamRemoved(String),
     StreamSound(crate::sounds::Cue),
     Publishing(Option<String>),
@@ -147,6 +148,7 @@ enum SessionCommand {
 
 #[derive(Clone, Default)]
 pub struct MediaState {
+    pub preview: crate::local_preview::State,
     pub latest: Arc<Mutex<Option<Pixels>>>,
     pub selected_track: Arc<Mutex<Option<String>>>,
     pub selected_participant: Arc<Mutex<Option<String>>>,
@@ -560,6 +562,7 @@ impl Drop for RemoteTasks {
 }
 struct Sharing {
     capture: Capture,
+    _preview: crate::local_preview::Worker,
     #[cfg(target_os = "windows")]
     _audio: Option<audio::windows::ProcessAudio>,
     #[cfg(target_os = "windows")]
@@ -681,7 +684,7 @@ async fn connected(
                                 }
                             } else {
                                 let (audio_faults, audio_receiver) = mpsc::unbounded_channel();
-                                match publish(room, capture, source.clone(), quality, audio, audio_faults, &events).await {
+                                match publish(room, capture, source.clone(), quality, audio, PublishContext { audio_faults, events: &events, preview: &media.preview }).await {
                                     Ok(value) => {
                                         sharing = Some(value);
                                         capture_faults = receiver;
@@ -791,7 +794,13 @@ async fn connected(
                                         if kind == VideoKind::Camera {
                                             last_camera = Instant::now();
                                             media.cameras.lock().insert(stream_id.clone(), pixels);
-                                        } else { *media.latest.lock() = Some(pixels); }
+                                        } else {
+                                            // Selection may have changed while converting this frame.
+                                            let selected = media.selected_track.lock();
+                                            if selected.as_deref() == Some(&stream_id) {
+                                                *media.latest.lock() = Some(pixels);
+                                            }
+                                        }
                                     }
                                 }));
                             }
@@ -804,7 +813,18 @@ async fn connected(
                             }
                         }
                     }
-                    Some(RoomEvent::TrackUnsubscribed { publication, .. }) | Some(RoomEvent::TrackUnpublished { publication, .. }) => {
+                    Some(RoomEvent::TrackUnsubscribed { publication, .. }) => {
+                        let sid = publication.sid().to_string();
+                        if let Some(task) = tasks.0.remove(&sid) { task.abort(); }
+                        media.cameras.lock().remove(&sid);
+                        let mut latest = media.latest.lock();
+                        if latest.as_ref().is_some_and(|frame| frame.track == sid) { latest.take(); }
+                        drop(latest);
+                        // The publication still exists. Reconnects and subscription
+                        // changes must not make the UI choose another publisher.
+                        events.send(Event::StreamPaused(sid));
+                    }
+                    Some(RoomEvent::TrackUnpublished { publication, .. }) => {
                         let sid = publication.sid().to_string();
                         if let Some(task) = tasks.0.remove(&sid) { task.abort(); }
                         media.cameras.lock().remove(&sid);
@@ -864,22 +884,32 @@ async fn publish_camera(room: &Room, capture: &camera::Capture) -> anyhow::Resul
     Ok(())
 }
 
+struct PublishContext<'a> {
+    audio_faults: mpsc::UnboundedSender<String>,
+    events: &'a Events,
+    preview: &'a crate::local_preview::State,
+}
+
 async fn publish(
     room: &Room,
     capture: Capture,
     source: Source,
     quality: Quality,
     audio_application: Option<audio::Application>,
-    audio_faults: mpsc::UnboundedSender<String>,
-    events: &Events,
+    context: PublishContext<'_>,
 ) -> anyhow::Result<Sharing> {
+    let PublishContext {
+        audio_faults,
+        events,
+        preview,
+    } = context;
     let track = LocalVideoTrack::create_video_track(
         &source.name,
         RtcVideoSource::Native(capture.source.clone()),
     );
     room.local_participant()
         .publish_track(
-            LocalTrack::Video(track),
+            LocalTrack::Video(track.clone()),
             TrackPublishOptions {
                 source: TrackSource::Screenshare,
                 simulcast: false,
@@ -907,6 +937,7 @@ async fn publish(
     let _ = (audio_application, audio_faults, events);
     Ok(Sharing {
         capture,
+        _preview: crate::local_preview::Worker::start(track, preview.clone()),
         #[cfg(target_os = "windows")]
         _audio: audio,
         #[cfg(target_os = "windows")]

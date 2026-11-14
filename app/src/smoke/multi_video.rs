@@ -84,8 +84,8 @@ pub(super) async fn check(server: &str, options: RoomOptions) -> anyhow::Result<
     let mut key_workers = tokio::task::JoinSet::new();
     key_workers.spawn(async move { a_crypto.run().await });
     key_workers.spawn(async move { b_crypto.run().await });
-    let (screen_a, video_a) = publish(&a, TrackSource::Screenshare).await?;
-    let (camera_a, cam_a) = publish(&a, TrackSource::Camera).await?;
+    let (mut screen_a, video_a) = publish(&a, TrackSource::Screenshare).await?;
+    let (mut camera_a, cam_a) = publish(&a, TrackSource::Camera).await?;
     let (screen_b, video_b) = publish(&b, TrackSource::Screenshare).await?;
     let (camera_b, cam_b) = publish(&b, TrackSource::Camera).await?;
     let mut feed = tokio::task::JoinSet::new();
@@ -127,7 +127,7 @@ pub(super) async fn check(server: &str, options: RoomOptions) -> anyhow::Result<
                             stream.title.starts_with("Teste de telas "),
                             "A transmissão perdeu o nome do convidado."
                         );
-                        streams.insert(stream.id, stream.kind);
+                        streams.insert(stream.id.clone(), stream);
                     }
                     Event::Participants(people) => {
                         roster_ready = people.len() == 3
@@ -147,15 +147,71 @@ pub(super) async fn check(server: &str, options: RoomOptions) -> anyhow::Result<
         .await
         .context("As quatro faixas não foram recebidas.")??;
         ensure!(
-            streams[&screen_a] == VideoKind::Screen && streams[&screen_b] == VideoKind::Screen,
+            streams[&screen_a].kind == VideoKind::Screen
+                && streams[&screen_b].kind == VideoKind::Screen,
             "Telas classificadas incorretamente."
         );
         ensure!(
-            streams[&camera_a] == VideoKind::Camera && streams[&camera_b] == VideoKind::Camera,
+            streams[&camera_a].kind == VideoKind::Camera
+                && streams[&camera_b].kind == VideoKind::Camera,
             "Câmeras classificadas incorretamente."
         );
         frames(&backend, &screen_a, &[&camera_a, &camera_b]).await?;
         frames(&backend, &screen_b, &[&camera_a, &camera_b]).await?;
+
+        // Use the same selection state as the UI while a real publisher replaces
+        // its connection and both track SIDs. Bob must never become a fallback.
+        let mut selected = crate::stream_selection::Selection::default();
+        selected.choose(Some(&streams[&screen_a]));
+        let owner = streams[&screen_a].participant.clone();
+        *backend.media.selected_track.lock() = Some(screen_a.clone());
+        a.simulate_scenario(livekit::rtc_engine::SimulateScenario::FullReconnect)
+            .await?;
+        let (new_screen, new_camera) = tokio::time::timeout(Duration::from_secs(25), async {
+            let mut new_screen = None;
+            let mut new_camera = None;
+            loop {
+                match backend.events.recv().await?.event {
+                    Event::StreamAdded(stream) => {
+                        selected.added(&stream);
+                        if stream.participant == owner {
+                            if stream.kind == VideoKind::Screen && stream.id != screen_a {
+                                new_screen = Some(stream.id.clone());
+                            } else if stream.kind == VideoKind::Camera && stream.id != camera_a {
+                                new_camera = Some(stream.id.clone());
+                            }
+                        }
+                    }
+                    Event::StreamRemoved(id) => {
+                        selected.removed(&id);
+                    }
+                    Event::Error(message) => anyhow::bail!(message),
+                    _ => {}
+                }
+                ensure!(
+                    selected.participant() == Some(owner.as_str()),
+                    "A reconexão mudou a pessoa escolhida."
+                );
+                ensure!(
+                    selected.track() != Some(screen_b.as_str()),
+                    "A outra transmissão assumiu a seleção."
+                );
+                *backend.media.selected_track.lock() = selected.track().map(str::to_owned);
+                if let (Some(screen), Some(camera)) = (&new_screen, &new_camera) {
+                    ensure!(
+                        selected.track() == Some(screen.as_str()),
+                        "A seleção não retomou a publicação escolhida."
+                    );
+                    break Ok::<_, anyhow::Error>((screen.clone(), camera.clone()));
+                }
+            }
+        })
+        .await
+        .context("A publicação não voltou após a reconexão completa.")??;
+        screen_a = new_screen;
+        camera_a = new_camera;
+        frames(&backend, &screen_a, &[&camera_a, &camera_b]).await?;
+        println!("PASS: reconexão real republica tela e webcam sem trocar para a outra pessoa.");
 
         unpublish_kind(&a, VideoKind::Screen).await;
         ensure!(

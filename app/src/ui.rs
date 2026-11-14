@@ -52,6 +52,7 @@ enum Connection {
 
 pub struct Telinha {
     backend: Backend,
+    app_icon: crate::app_icon::State,
     update_state: crate::updates::State,
     update_installing: bool,
     generation: u64,
@@ -73,6 +74,7 @@ pub struct Telinha {
     participants: Vec<crate::participants::Person>,
     participants_open: bool,
     streams: Vec<RemoteStream>,
+    stream_selection: crate::stream_selection::Selection,
     cameras: Vec<RemoteStream>,
     camera_images: HashMap<String, Arc<RenderImage>>,
     camera_devices: Vec<crate::camera::Device>,
@@ -84,9 +86,13 @@ pub struct Telinha {
     camera_selected: Option<usize>,
     camera_publishing: Option<(String, String)>,
     image: Option<Arc<RenderImage>>,
+    local_preview: bool,
+    local_preview_image: Option<Arc<RenderImage>>,
     picker: bool,
     sources: Vec<Source>,
     selected_source: Option<usize>,
+    source_tab_screen: bool,
+    source_page: usize,
     loading_sources: bool,
     refreshing_sources: bool,
     source_request: u64,
@@ -97,6 +103,8 @@ pub struct Telinha {
     audio_selection: audio_selection::Selection,
     sharing_audio: audio_selection::Selection,
     audio_apps_open: bool,
+    audio_app_page: usize,
+    audio_search: String,
     audio_selection_warning: Option<&'static str>,
     publishing: Option<String>,
     starting: bool,
@@ -107,6 +115,7 @@ pub struct Telinha {
     dragging_volume: bool,
     fullscreen: bool,
     controls_visible: bool,
+    ghost_visible: bool,
     mouse_at: Instant,
     link_input: async_channel::Receiver<String>,
     account: Option<telinha_shared::UserProfile>,
@@ -133,6 +142,7 @@ impl Telinha {
     ) -> Self {
         let mut app = Self {
             backend,
+            app_icon: crate::app_icon::State::default(),
             update_state: crate::updates::State::Idle,
             update_installing: false,
             generation: 0,
@@ -154,6 +164,7 @@ impl Telinha {
             participants: vec![],
             participants_open: false,
             streams: vec![],
+            stream_selection: crate::stream_selection::Selection::default(),
             cameras: vec![],
             camera_images: HashMap::new(),
             camera_devices: vec![],
@@ -165,9 +176,13 @@ impl Telinha {
             camera_selected: None,
             camera_publishing: None,
             image: None,
+            local_preview: false,
+            local_preview_image: None,
             picker: false,
             sources: vec![],
             selected_source: None,
+            source_tab_screen: false,
+            source_page: 0,
             loading_sources: false,
             refreshing_sources: false,
             source_request: 0,
@@ -182,6 +197,8 @@ impl Telinha {
                 audio_selection::Selection::Off
             },
             audio_apps_open: false,
+            audio_app_page: 0,
+            audio_search: String::new(),
             audio_selection_warning: None,
             publishing: None,
             starting: false,
@@ -192,6 +209,7 @@ impl Telinha {
             dragging_volume: false,
             fullscreen: false,
             controls_visible: true,
+            ghost_visible: true,
             mouse_at: Instant::now(),
             link_input,
             account: None,
@@ -439,6 +457,11 @@ impl Telinha {
                                         .then_some(0)
                                 });
                             self.audio_sources = audio_sources;
+                            if let Some(source) =
+                                self.selected_source.and_then(|i| self.sources.get(i))
+                            {
+                                self.source_tab_screen = source.kind == livekit::webrtc::desktop_capturer::DesktopCaptureSourceType::Screen;
+                            }
                             self.update_audio_for_source();
                         }
                         Err(message) => {
@@ -452,9 +475,8 @@ impl Telinha {
                         .audio_selection
                         .refresh(self.audio_sources.iter().map(audio_application_key))
                     {
-                        self.audio_selection_warning = Some(
-                            "O aplicativo de áudio não está mais disponível. Escolha outro ou selecione Sem áudio.",
-                        );
+                        self.audio_selection_warning =
+                            Some("O aplicativo saiu. Escolha outro ou use Sem áudio.");
                         self.audio_apps_open = true;
                     }
                 }
@@ -488,22 +510,29 @@ impl Telinha {
                         self.cameras.push(stream);
                         continue;
                     }
+                    let selected = self.stream_selection.added(&stream);
                     self.streams.retain(|s| s.id != id);
                     self.streams.push(stream);
-                    if self.backend.media.selected_track.lock().is_none() {
-                        self.select_stream(Some(id), cx);
+                    if selected {
+                        self.sync_stream_selection(cx);
+                    }
+                }
+                Event::StreamPaused(id) => {
+                    self.drop_camera_image(&id, cx);
+                    if self.stream_selection.track() == Some(&id) {
+                        self.sync_stream_selection(cx);
                     }
                 }
                 Event::StreamRemoved(id) => {
                     self.cameras.retain(|s| s.id != id);
                     self.drop_camera_image(&id, cx);
-                    let selected = self.backend.media.selected_track.lock().as_deref() == Some(&id);
+                    let selected = self.stream_selection.removed(&id);
                     if let Some(removed) = self.streams.iter().find(|s| s.id == id) {
                         self.toast(format!("{} parou de transmitir.", removed.title));
                     }
                     self.streams.retain(|s| s.id != id);
                     if selected {
-                        self.select_stream(self.streams.first().map(|s| s.id.clone()), cx);
+                        self.sync_stream_selection(cx);
                     }
                 }
                 Event::StreamSound(cue) => {
@@ -519,7 +548,11 @@ impl Telinha {
                         self.close_source_picker(cx);
                         self.starting = false;
                     }
+                    let had_preview = self.local_preview;
                     self.set_publishing(name);
+                    if had_preview && !self.local_preview {
+                        self.sync_stream_selection(cx);
+                    }
                 }
                 Event::CaptureFps(fps) => self.fps = fps,
                 Event::Cameras { request, result } => {
@@ -586,6 +619,21 @@ impl Telinha {
                 changed = true;
             }
         }
+        if self.local_preview {
+            if let Some(frame) = self.backend.media.preview.take()
+                && let Some(buffer) =
+                    image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra)
+            {
+                let new = Arc::new(RenderImage::new([image::Frame::new(buffer)]));
+                if let Some(old) = self.local_preview_image.replace(new) {
+                    cx.drop_image(old, None);
+                }
+                changed = true;
+            }
+        } else if let Some(old) = self.local_preview_image.take() {
+            cx.drop_image(old, None);
+            changed = true;
+        }
         let latest = self.backend.media.latest.lock().take();
         if let Some(frame) = latest
             && self.backend.media.selected_track.lock().as_deref() == Some(&frame.track)
@@ -629,6 +677,14 @@ impl Telinha {
             && self.mouse_at.elapsed() >= Duration::from_secs(2)
         {
             self.controls_visible = false;
+            changed = true;
+        }
+        if self.fullscreen
+            && self.ghost_visible
+            && !self.dragging_volume
+            && self.mouse_at.elapsed().as_secs_f32() >= 5.0
+        {
+            self.ghost_visible = self.mouse_at.elapsed().as_secs_f32() < 5.35;
             changed = true;
         }
         self.present_feedback(cx);
@@ -758,6 +814,10 @@ impl Telinha {
         cx.notify();
     }
     fn set_publishing(&mut self, name: Option<String>) {
+        if name.is_none() {
+            self.local_preview = false;
+            self.backend.media.preview.set_enabled(false);
+        }
         if self.publishing.is_some() != name.is_some() {
             let cue = if name.is_some() {
                 Cue::Started
@@ -770,13 +830,29 @@ impl Telinha {
     }
 
     fn select_stream(&mut self, id: Option<String>, cx: &mut Context<Self>) {
-        let participant = id.as_ref().and_then(|id| {
-            self.streams
-                .iter()
-                .find(|s| &s.id == id)
-                .map(|s| s.participant.clone())
-        });
-        *self.backend.media.selected_track.lock() = id;
+        self.local_preview = false;
+        self.backend.media.preview.set_enabled(false);
+        if let Some(image) = self.local_preview_image.take() {
+            cx.drop_image(image, None);
+        }
+        let stream = id
+            .as_ref()
+            .and_then(|id| self.streams.iter().find(|s| &s.id == id));
+        self.stream_selection.choose(stream);
+        self.sync_stream_selection(cx);
+    }
+
+    fn sync_stream_selection(&mut self, cx: &mut Context<Self>) {
+        let track = if self.local_preview {
+            None
+        } else {
+            self.stream_selection.track().map(str::to_owned)
+        };
+        let participant = track
+            .as_ref()
+            .and(self.stream_selection.participant())
+            .map(str::to_owned);
+        *self.backend.media.selected_track.lock() = track;
         *self.backend.media.selected_participant.lock() = participant;
         self.backend.media.latest.lock().take();
         if let Some(image) = self.image.take() {
@@ -792,6 +868,14 @@ impl Telinha {
         }
         let _ = self.backend.commands.send(Command::StopSourcePreviews);
     }
+    fn set_local_preview(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.local_preview = enabled && self.publishing.is_some();
+        self.backend.media.preview.set_enabled(self.local_preview);
+        if let Some(image) = self.local_preview_image.take() {
+            cx.drop_image(image, None);
+        }
+        self.sync_stream_selection(cx);
+    }
     fn close_source_picker(&mut self, cx: &mut Context<Self>) {
         self.clear_source_previews(cx);
         self.picker = false;
@@ -799,6 +883,8 @@ impl Telinha {
         self.refreshing_sources = false;
         self.sources.clear();
         self.selected_source = None;
+        self.source_tab_screen = false;
+        self.source_page = 0;
         self.audio_sources.clear();
         self.audio_selection = if cfg!(target_os = "windows") {
             audio_selection::Selection::FollowWindow
@@ -806,6 +892,8 @@ impl Telinha {
             audio_selection::Selection::Off
         };
         self.audio_apps_open = false;
+        self.audio_app_page = 0;
+        self.audio_search.clear();
         self.audio_selection_warning = None;
     }
     fn choose_source(&mut self, cx: &mut Context<Self>) {
@@ -862,9 +950,8 @@ impl Telinha {
             && self.audio_selection.select_display()
         {
             self.audio_apps_open = true;
-            self.audio_selection_warning = Some(
-                "Ao compartilhar o monitor, escolha qual aplicativo seus amigos vão ouvir — ou selecione Sem áudio.",
-            );
+            self.audio_selection_warning =
+                Some("Escolha um aplicativo para o áudio, ou use Sem áudio.");
         }
     }
     fn share(&mut self, cx: &mut Context<Self>) {
@@ -953,6 +1040,38 @@ impl Telinha {
         }
     }
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.fullscreen {
+            self.mouse_at = Instant::now();
+            self.controls_visible = true;
+            self.ghost_visible = true;
+            cx.notify();
+        }
+        if self.picker && self.audio_apps_open {
+            let key = &event.keystroke;
+            if key.key == "escape" {
+                self.audio_apps_open = false;
+            } else if key.modifiers.control || key.modifiers.platform {
+                match key.key.as_str() {
+                    "a" => self.audio_search.clear(),
+                    "v" => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                            self.audio_search =
+                                text.chars().filter(|c| !c.is_control()).take(80).collect();
+                        }
+                    }
+                    _ => {}
+                }
+            } else if matches!(key.key.as_str(), "backspace" | "delete") {
+                self.audio_search.pop();
+            } else if let Some(text) = &key.key_char {
+                self.audio_search
+                    .extend(text.chars().filter(|c| !c.is_control()));
+                self.audio_search = self.audio_search.chars().take(80).collect();
+            }
+            self.audio_app_page = 0;
+            cx.notify();
+            return;
+        }
         if self.guest_prompt.is_some() {
             self.guest_key(event, window, cx);
             return;
@@ -1442,6 +1561,10 @@ impl Focusable for Telinha {
 }
 impl Render for Telinha {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.app_icon.update(
+            self.publishing.is_some() || self.camera_publishing.is_some(),
+            window,
+        );
         window.set_window_title(
             if self.publishing.is_some() || self.camera_publishing.is_some() {
                 "telinha · no ar"
@@ -1467,14 +1590,29 @@ impl Render for Telinha {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    if this.account_menu_open || this.participants_open {
+                    if this.fullscreen {
+                        this.mouse_at = Instant::now();
+                        this.controls_visible = true;
+                        this.ghost_visible = true;
+                        cx.notify();
+                    }
+                    if this.account_menu_open || this.participants_open || this.audio_apps_open {
                         this.account_menu_open = false;
                         this.participants_open = false;
+                        this.audio_apps_open = false;
                         cx.notify();
                     }
                 }),
             )
             .capture_any_mouse_up(cx.listener(|this, _, _, _| this.dragging_volume = false))
+            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                if this.fullscreen {
+                    this.mouse_at = Instant::now();
+                    this.controls_visible = true;
+                    this.ghost_visible = true;
+                    cx.notify();
+                }
+            }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 this.mouse_at = Instant::now();
                 if this.dragging_volume {
@@ -1484,8 +1622,9 @@ impl Render for Telinha {
                         this.dragging_volume = false;
                     }
                 }
-                if this.fullscreen && !this.controls_visible {
+                if this.fullscreen && (!this.controls_visible || !this.ghost_visible) {
                     this.controls_visible = true;
+                    this.ghost_visible = true;
                     cx.notify();
                 }
             }));

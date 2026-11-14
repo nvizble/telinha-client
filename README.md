@@ -92,9 +92,13 @@ nas duas plataformas; não contêm credenciais de produção ou de assinatura.
 
 Tela, webcam e áudio usam E2EE AES-GCM do LiveKit. Chaves são geradas nos dispositivos e trocadas automaticamente em envelopes ECDH P-256/HKDF/AES-GCM. O relay não recebe chaves de mídia em claro; não há fallback sem criptografia. Entrada automática e links públicos continuam funcionando: participantes admitidos recebem as chaves e podem gravar a mídia.
 
+Falhas transitórias no relay têm novas tentativas limitadas pelo prazo de renovação da sessão. Um participante sem chave não encerra a sala dos demais: somente sua mídia fica sem decodificação. Revogação e falhas de integridade continuam encerrando a conexão. Os diagnósticos registram categorias e tentativas, sem chaves ou credenciais.
+
 A autenticação das chaves e a lista de membros dependem da API de admissão. Não há verificação fora de banda; um servidor de admissão malicioso poderia substituir chaves ou admitir participantes. E2EE não oculta metadados nem protege dispositivos comprometidos. `shared/testdata/e2ee-v1.json` contém apenas chaves artificiais públicas para teste.
 
 **Trocar tela** preserva a sessão e a webcam. No Windows, compartilhar um monitor pede a fonte de áudio explicitamente; Discord e Telinha não são fontes permitidas. Se o Discord estiver em uma aba, escolha o jogo como fonte: captura por processo não separa abas de navegador.
+
+**Ver minha tela** abre uma prévia local opcional, sem reprodução de áudio, a partir da captura já em andamento. Ela começa desligada, limita a prévia a 720p e 10 fps e não altera o áudio enviado aos outros participantes. O ícone fica laranja enquanto tela ou webcam estão publicadas. Em tela cheia, logo e nome desaparecem após cinco segundos de inatividade.
 
 O cliente envia os dados necessários para entrar na sessão, autenticar a conta
 opcional do Discord e publicar/receber mídia. Nome e avatar identificam os

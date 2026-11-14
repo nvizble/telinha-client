@@ -3,6 +3,7 @@
     windows_subsystem = "windows"
 )]
 mod account;
+mod app_icon;
 mod audio;
 mod camera;
 mod capture;
@@ -12,12 +13,14 @@ mod feedback;
 mod guest;
 mod home_logo;
 mod icons;
+mod local_preview;
 mod participants;
 mod protocol;
 mod session;
 mod smoke;
 mod sounds;
 mod source_preview;
+mod stream_selection;
 mod ui;
 mod updates;
 

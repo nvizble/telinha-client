@@ -90,35 +90,148 @@ impl Telinha {
             .justify_center()
             .overflow_hidden()
             .when(!self.fullscreen, |well| well.rounded(px(10.)));
-        if let Some(image) = &self.image {
+        if let Some(image) = if self.local_preview {
+            &self.local_preview_image
+        } else {
+            &self.image
+        } {
             well = well.bg(rgb(0)).child(
                 img(image.clone())
                     .size_full()
                     .object_fit(ObjectFit::Contain),
             );
-            if let Some(stream) = self
+            if self.local_preview {
+                if !self.fullscreen {
+                    well = well.child(
+                        div()
+                            .absolute()
+                            .bottom_4()
+                            .left_4()
+                            .px_3()
+                            .py_2()
+                            .rounded(px(8.))
+                            .bg(gpui::rgba(0x17181AD9))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_sm()
+                            .child(icon("icons/mute.svg", 15., MUTED))
+                            .child("Você · prévia sem áudio"),
+                    );
+                } else if self.ghost_visible {
+                    let opacity = 0.22
+                        * (1.0
+                            - ((self.mouse_at.elapsed().as_secs_f32() - 5.0) / 0.35)
+                                .clamp(0.0, 1.0));
+                    let name = self
+                        .account
+                        .as_ref()
+                        .map(|a| a.display_name.clone())
+                        .or_else(|| self.guest_name.clone())
+                        .unwrap_or_else(|| "Você".into());
+                    well = well.child(
+                        div()
+                            .absolute()
+                            .left(px(24.))
+                            .bottom(px(if self.controls_visible { 104. } else { 24. }))
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .opacity(opacity)
+                            .child(
+                                svg()
+                                    .path("logo.svg")
+                                    .w(px(53.))
+                                    .h(px(17.))
+                                    .text_color(rgb(FG)),
+                            )
+                            .child(div().w(px(1.)).h(px(13.)).bg(rgb(FG)).opacity(0.7))
+                            .child(
+                                div()
+                                    .max_w(px(220.))
+                                    .text_size(px(12.))
+                                    .truncate()
+                                    .child(name),
+                            ),
+                    );
+                }
+            } else if let Some(stream) = self
                 .streams
                 .iter()
                 .find(|s| self.backend.media.selected_track.lock().as_ref() == Some(&s.id))
             {
-                well = well.child(
-                    div()
-                        .absolute()
-                        .bottom_4()
-                        .left_4()
-                        .px_3()
-                        .py_2()
-                        .rounded(px(8.))
-                        .bg(gpui::rgba(0x17181AD9))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .text_sm()
-                        .child(self.avatar(stream.avatar_url.as_deref(), &stream.title, 24.))
-                        .child(div().max_w(px(260.)).truncate().child(stream.title.clone()))
-                        .child(div().ml_1().size(px(6.)).rounded_full().bg(rgb(LIVE))),
-                );
+                if self.fullscreen && self.ghost_visible {
+                    let person_id = telinha_shared::discord_user_id(&stream.participant)
+                        .map(|id| format!("discord:{id}"))
+                        .unwrap_or_else(|| stream.participant.clone());
+                    let name = self
+                        .participants
+                        .iter()
+                        .find(|p| p.id == person_id)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| {
+                            stream
+                                .title
+                                .split(" · ")
+                                .next()
+                                .unwrap_or(&stream.title)
+                                .to_owned()
+                        });
+                    let opacity = 0.22
+                        * (1.0
+                            - ((self.mouse_at.elapsed().as_secs_f32() - 5.0) / 0.35)
+                                .clamp(0.0, 1.0));
+                    well = well.child(
+                        div()
+                            .absolute()
+                            .left(px(24.))
+                            .bottom(px(if self.controls_visible { 104. } else { 24. }))
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .opacity(opacity)
+                            .child(
+                                svg()
+                                    .path("logo.svg")
+                                    .w(px(53.))
+                                    .h(px(17.))
+                                    .text_color(rgb(FG)),
+                            )
+                            .child(div().w(px(1.)).h(px(13.)).bg(rgb(FG)).opacity(0.7))
+                            .child(
+                                div()
+                                    .max_w(px(220.))
+                                    .text_size(px(12.))
+                                    .truncate()
+                                    .child(name),
+                            ),
+                    );
+                } else if !self.fullscreen {
+                    well = well.child(
+                        div()
+                            .absolute()
+                            .bottom_4()
+                            .left_4()
+                            .px_3()
+                            .py_2()
+                            .rounded(px(8.))
+                            .bg(gpui::rgba(0x17181AD9))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_sm()
+                            .child(self.avatar(stream.avatar_url.as_deref(), &stream.title, 24.))
+                            .child(div().max_w(px(260.)).truncate().child(stream.title.clone()))
+                            .child(div().ml_1().size(px(6.)).rounded_full().bg(rgb(LIVE))),
+                    );
+                }
             }
+        } else if self.local_preview {
+            well = well.child(empty_state(
+                "icons/eye.svg",
+                "Preparando sua prévia",
+                "Vídeo local, sem reprodução de áudio.",
+            ));
         } else if camera_gallery {
             let columns = if camera_count == 1 { 1 } else { 2 };
             let rows = camera_count.div_ceil(columns);
@@ -138,10 +251,21 @@ impl Telinha {
                     .children(self.camera_tiles(height)),
             );
         } else if !self.streams.is_empty() {
+            let waiting = self.stream_selection.track().is_none() && !self.reconnecting;
             well = well.child(empty_state(
                 "icons/monitor.svg",
-                "Recebendo a transmissão",
-                "O vídeo aparece aqui em instantes.",
+                if waiting {
+                    "A transmissão foi interrompida"
+                } else {
+                    "Recebendo a transmissão"
+                },
+                if waiting && self.fullscreen {
+                    "Pressione Esc para escolher outra transmissão."
+                } else if waiting {
+                    "Ela volta aqui quando estiver disponível. Você também pode escolher outra."
+                } else {
+                    "O vídeo aparece aqui em instantes."
+                },
             ));
         } else if let Some(name) = &self.publishing {
             well =
@@ -433,6 +557,7 @@ impl Telinha {
 
     pub(super) fn controls(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let compact = window.viewport_size().width < px(1180.);
+        let narrow = window.viewport_size().width < px(1040.);
         let mut row = div()
             .h(px(72.))
             .flex_shrink_0()
@@ -443,13 +568,13 @@ impl Telinha {
             .when(self.fullscreen, |row| {
                 row.bg(gpui::rgba(0x2A2C30F2)).rounded(px(12.))
             });
-        if !self.streams.is_empty() {
+        if !self.streams.is_empty() || self.local_preview {
             row = row
                 .child(
                     button_with_icon(
                         "mute",
                         "",
-                        if self.volume == 0 {
+                        if self.volume == 0 || self.local_preview {
                             "icons/mute.svg"
                         } else {
                             "icons/volume.svg"
@@ -500,6 +625,7 @@ impl Telinha {
                         window.toggle_fullscreen();
                         this.fullscreen = !this.fullscreen;
                         this.controls_visible = true;
+                        this.ghost_visible = true;
                         this.mouse_at = Instant::now();
                         cx.notify();
                     })),
@@ -527,11 +653,34 @@ impl Telinha {
             );
         }
         row = row.child(div().flex_1());
+        if self.publishing.is_some() {
+            row = row.child(
+                button_with_icon(
+                    "local-preview",
+                    if self.local_preview {
+                        "Ocultar prévia"
+                    } else {
+                        "Ver minha tela"
+                    },
+                    "icons/eye.svg",
+                    false,
+                )
+                .when(narrow, |button| button.px_2().text_size(px(11.)))
+                .when(self.local_preview, |button| {
+                    button.border_color(rgb(FG)).bg(rgb(PANEL))
+                })
+                .on_click(
+                    cx.listener(|this, _, _, cx| this.set_local_preview(!this.local_preview, cx)),
+                ),
+            );
+        }
         let camera_on = self.camera_publishing.is_some() || self.camera_starting;
         row = row.child(
             button_with_colored_icon(
                 "webcam",
-                if self.camera_starting {
+                if narrow {
+                    ""
+                } else if self.camera_starting {
                     "Cancelar webcam"
                 } else if camera_on {
                     "Desligar webcam"
@@ -559,7 +708,13 @@ impl Telinha {
                 .child(
                     button_with_icon(
                         "switch-screen",
-                        if compact { "Trocar" } else { "Trocar tela" },
+                        if narrow {
+                            ""
+                        } else if compact {
+                            "Trocar"
+                        } else {
+                            "Trocar tela"
+                        },
                         "icons/refresh.svg",
                         false,
                     )
