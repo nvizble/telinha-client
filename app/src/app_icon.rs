@@ -47,7 +47,9 @@ fn set(live: bool, window: &gpui::Window) -> anyhow::Result<()> {
         },
         core::PCWSTR,
     };
-    let RawWindowHandle::Win32(handle) = HasWindowHandle::window_handle(window)?.as_raw() else {
+    let native = HasWindowHandle::window_handle(window)
+        .map_err(|error| anyhow::anyhow!("Could not access native window: {error}"))?;
+    let RawWindowHandle::Win32(handle) = native.as_raw() else {
         anyhow::bail!("No Win32 window handle");
     };
     let hwnd = HWND(handle.hwnd.get() as *mut _);

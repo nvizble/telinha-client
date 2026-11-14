@@ -23,7 +23,7 @@
     "app/build.rs": "bb83eb3f02e31c82b9d08dbe4eeb99e391ab24d83cdf312b72577031e26461af",
     "app/native/CameraCapture.swift": "94e936c478e702ca090e0be738fb9a0c4665d6d0e7db3bfaff62ca83a34a0bd2",
     "app/src/account.rs": "985e69af8b55fb37e687c62185e43c4dd50f5bba54b83bb5b2a2776be3d2b3e2",
-    "app/src/app_icon.rs": "97ae29e7672260fec88850714dbb2509831529cf4090bd83fc51c361d9e2f974",
+    "app/src/app_icon.rs": "a7de8e8cf35cccb4c244a72189611b23db67186a83fe0cae778cdf93a712ebbe",
     "app/src/app_icon_macos.m": "38a67879c00c2d13f044ae95465dea41acbbb96d4b9e8a5fb68007267360d50c",
     "app/src/audio/policy.rs": "9e558c50ccf29d5c924ffbc8fa811c6ad506569c286a9e959af6bdc56b08f8ce",
     "app/src/audio/target.rs": "b7689c16db177c4c59519c66d3f1c0eb2d242ea07ac01635bf5551d6e1c5a988",
