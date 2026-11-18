@@ -1,15 +1,20 @@
 //! Audio applications which would send a call back to its participants.
 pub(super) fn blocked_executable(path: &str) -> bool {
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    echo_executable(path)
+        || ["explorer.exe", "applicationframehost.exe"]
+            .iter()
+            .any(|blocked| name.eq_ignore_ascii_case(blocked))
+}
+
+pub(super) fn echo_executable(path: &str) -> bool {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     [
         "discord.exe",
         "discordcanary.exe",
         "discordptb.exe",
         "discorddevelopment.exe",
         "telinha.exe",
-        // Their process trees can contain unrelated applications, including a call.
-        "explorer.exe",
-        "applicationframehost.exe",
     ]
     .iter()
     .any(|blocked| name.eq_ignore_ascii_case(blocked))

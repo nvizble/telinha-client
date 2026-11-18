@@ -20,6 +20,7 @@ pub const PATHS: &[&str] = &[
     "icons/next.svg",
     "icons/search.svg",
     "icons/eye.svg",
+    "icons/gallery.svg",
     "icons/close.svg",
     "icons/stop.svg",
     "icons/share.svg",
@@ -77,6 +78,9 @@ pub fn load(path: &str) -> Option<Vec<u8>> {
         "icons/search.svg" => r#"<circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/>"#,
         "icons/eye.svg" => {
             r#"<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>"#
+        }
+        "icons/gallery.svg" => {
+            r#"<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>"#
         }
         "icons/close.svg" => r#"<path d="m6 6 12 12M6 18 18 6"/>"#,
         "icons/stop.svg" => r#"<rect x="6" y="6" width="12" height="12" rx="2"/>"#,

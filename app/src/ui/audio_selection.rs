@@ -8,6 +8,7 @@ pub(super) struct ApplicationKey {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum Selection {
     Off,
+    Desktop,
     #[default]
     FollowWindow,
     // None means the user must choose an application, never a fallback source.
@@ -31,7 +32,7 @@ impl Selection {
         available: impl IntoIterator<Item = ApplicationKey>,
     ) -> Option<ApplicationKey> {
         match self {
-            Self::Off | Self::Application(None) => None,
+            Self::Off | Self::Desktop | Self::Application(None) => None,
             Self::FollowWindow => shared_window.and_then(|window_id| {
                 available
                     .into_iter()
@@ -76,7 +77,11 @@ mod tests {
         let mut follow = Selection::FollowWindow;
         assert!(follow.select_display());
         assert_eq!(follow, Selection::Application(None));
-        for mut preference in [Selection::Off, Selection::Application(Some(GAME))] {
+        for mut preference in [
+            Selection::Off,
+            Selection::Desktop,
+            Selection::Application(Some(GAME)),
+        ] {
             let before = preference;
             assert!(!preference.select_display());
             assert_eq!(preference, before);
@@ -158,7 +163,7 @@ mod tests {
 
     #[test]
     fn refreshing_does_not_change_off_or_follow_modes() {
-        for mut selection in [Selection::Off, Selection::FollowWindow] {
+        for mut selection in [Selection::Off, Selection::Desktop, Selection::FollowWindow] {
             let before = selection;
             assert!(!selection.refresh([]));
             assert_eq!(selection, before);

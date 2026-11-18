@@ -1,6 +1,84 @@
 use super::*;
 
+const OWN_CAMERA: &str = "local-camera";
+
 impl Telinha {
+    pub(super) fn sync_camera_focus(&self) {
+        *self.backend.media.focused_camera.lock() = if self.gallery {
+            None
+        } else {
+            self.camera_focus.track().map(str::to_owned)
+        };
+    }
+
+    fn own_camera_stream(&self) -> Option<RemoteStream> {
+        let (id, _) = self.camera_publishing.as_ref()?;
+        Some(RemoteStream {
+            id: id.clone(),
+            title: "Você".into(),
+            participant: OWN_CAMERA.into(),
+            avatar_url: self.account.as_ref().map(|a| a.avatar_url.clone()),
+            kind: VideoKind::Camera,
+        })
+    }
+
+    pub(super) fn refresh_own_camera_focus(&mut self) {
+        if self.camera_focus.participant() == Some(OWN_CAMERA)
+            && let Some(stream) = self.own_camera_stream()
+        {
+            self.camera_focus.choose(Some(&stream));
+            self.sync_camera_focus();
+        }
+    }
+
+    fn focus_camera(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
+        let stream = self
+            .cameras
+            .iter()
+            .find(|s| s.id == id)
+            .cloned()
+            .or_else(|| self.own_camera_stream().filter(|s| s.id == id));
+        let Some(stream) = stream else {
+            return false;
+        };
+        self.set_gallery(false, cx);
+        self.set_local_preview(false, cx);
+        self.camera_focus.choose(Some(&stream));
+        self.camera_focus_title = stream.title.clone();
+        self.sync_camera_focus();
+        self.controls_visible = true;
+        self.ghost_visible = true;
+        self.mouse_at = Instant::now();
+        cx.notify();
+        true
+    }
+
+    fn fullscreen_camera(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focus_camera(id, cx) {
+            if !self.fullscreen {
+                window.toggle_fullscreen();
+            }
+            self.fullscreen = true;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn clear_camera_focus(&mut self) {
+        self.camera_focus.choose(None);
+        self.camera_focus_title.clear();
+        self.sync_camera_focus();
+    }
+
+    pub(super) fn exit_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.fullscreen {
+            window.toggle_fullscreen();
+        }
+        self.fullscreen = false;
+        self.controls_visible = true;
+        self.ghost_visible = true;
+        cx.notify();
+    }
+
     pub(super) fn choose_camera(&mut self, cx: &mut Context<Self>) {
         self.close_source_picker(cx);
         self.camera_request += 1;
@@ -49,6 +127,10 @@ impl Telinha {
     }
 
     pub(super) fn drop_camera_image(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.camera_focus.removed(id) {
+            self.camera_focus.recover(&self.cameras, id);
+            self.sync_camera_focus();
+        }
         self.backend.media.cameras.lock().remove(id);
         if let Some(image) = self.camera_images.remove(id) {
             cx.drop_image(image, None);
@@ -68,6 +150,9 @@ impl Telinha {
         self.camera_loading = false;
         self.camera_error = None;
         self.camera_publishing = None;
+        self.camera_focus.choose(None);
+        self.camera_focus_title.clear();
+        self.sync_camera_focus();
         self.cameras.clear();
         self.backend.media.cameras.lock().clear();
         for (_, image) in self.camera_images.drain() {
@@ -86,8 +171,16 @@ impl Telinha {
         avatar: Option<&str>,
         own: bool,
         height: f32,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
+        let selected = id.to_owned();
+        let fullscreen_id = id.to_owned();
         div()
+            .id(SharedString::from(format!("camera-{id}")))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.focus_camera(&selected, cx);
+            }))
             .relative()
             .w_full()
             .min_w_0()
@@ -97,7 +190,11 @@ impl Telinha {
             .overflow_hidden()
             .bg(rgb(SUNK))
             .border_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(if self.camera_focus.track() == Some(id) {
+                FG
+            } else {
+                LINE
+            }))
             .flex()
             .items_center()
             .justify_center()
@@ -137,12 +234,24 @@ impl Telinha {
                             } else {
                                 name.to_owned()
                             })),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        button_with_icon("camera-fullscreen", "", "icons/fullscreen.svg", false)
+                            .w(px(30.))
+                            .h(px(28.))
+                            .px_0()
+                            .bg(gpui::rgba(0x17181ACC))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.fullscreen_camera(&fullscreen_id, window, cx);
+                            })),
                     ),
             )
             .into_any_element()
     }
 
-    pub(super) fn camera_tiles(&self, height: f32) -> Vec<AnyElement> {
+    pub(super) fn camera_tiles(&self, height: f32, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut tiles: Vec<_> = self
             .cameras
             .iter()
@@ -153,6 +262,7 @@ impl Telinha {
                     camera.avatar_url.as_deref(),
                     false,
                     height,
+                    cx,
                 )
             })
             .collect();
@@ -163,6 +273,7 @@ impl Telinha {
                 self.account.as_ref().map(|a| a.avatar_url.as_str()),
                 true,
                 height,
+                cx,
             ));
         }
         tiles

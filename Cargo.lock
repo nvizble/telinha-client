@@ -5954,7 +5954,7 @@ checksum = "c1bbb9f3c5c463a01705937a24fdabc5047929ac764b2d5b9cf681c1f5041ed5"
 
 [[package]]
 name = "telinha"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -5984,7 +5984,7 @@ dependencies = [
 
 [[package]]
 name = "telinha-shared"
-version = "0.10.2"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

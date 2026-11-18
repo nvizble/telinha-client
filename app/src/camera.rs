@@ -113,6 +113,7 @@ pub async fn devices() -> anyhow::Result<Vec<Device>> {
 pub struct Capture {
     pub source: NativeVideoSource,
     pub preview: Arc<Mutex<Option<Frame>>>,
+    pub preview_focused: Arc<AtomicBool>,
     _worker: Worker,
 }
 impl Capture {
@@ -126,6 +127,8 @@ impl Capture {
         let stopped = worker.stopped.clone();
         let preview = Arc::new(Mutex::new(None));
         let thread_preview = preview.clone();
+        let preview_focused = Arc::new(AtomicBool::new(false));
+        let thread_focused = preview_focused.clone();
         let runtime = tokio::runtime::Handle::current();
         let (ready, first_frame) = oneshot::channel();
         std::thread::Builder::new()
@@ -152,8 +155,9 @@ impl Capture {
                         let source = source.get_or_insert_with(|| {
                             NativeVideoSource::new(VideoResolution { width, height }, false)
                         });
-                        if last_preview.elapsed() >= Duration::from_millis(66) {
-                            let (w, h) = fit(width, height, 640, 480);
+                        let (w, h, interval) =
+                            view_profile(width, height, thread_focused.load(Ordering::Relaxed));
+                        if last_preview.elapsed() >= interval {
                             let small = buffer.scale(w as i32, h as i32);
                             let mut bgra = vec![0; w as usize * h as usize * 4];
                             small.to_argb(
@@ -195,9 +199,21 @@ impl Capture {
         Ok(Self {
             source,
             preview,
+            preview_focused,
             _worker: worker,
         })
     }
+}
+
+/// Keep gallery previews cheap; only the focused webcam uses the full 720p/30 budget.
+pub fn view_profile(width: u32, height: u32, focused: bool) -> (u32, u32, Duration) {
+    let (max_width, max_height, millis) = if focused {
+        (1280, 720, 33)
+    } else {
+        (640, 480, 66)
+    };
+    let (width, height) = fit(width, height, max_width, max_height);
+    (width, height, Duration::from_millis(millis))
 }
 
 pub fn fit(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
@@ -564,6 +580,26 @@ mod tests {
         assert!(pixels[2] > 240 && pixels[0] < 10 && pixels[1] < 10);
         assert_eq!(fit(1920, 1080, 640, 480), (640, 360));
         assert_eq!(fit(640, 480, 1280, 720), (640, 480));
+    }
+
+    #[test]
+    fn focused_camera_uses_the_published_budget_and_gallery_stays_small() {
+        assert_eq!(
+            view_profile(1280, 720, false),
+            (640, 360, Duration::from_millis(66))
+        );
+        assert_eq!(
+            view_profile(3840, 2160, true),
+            (1280, 720, Duration::from_millis(33))
+        );
+        assert_eq!(
+            view_profile(640, 480, true),
+            (640, 480, Duration::from_millis(33))
+        );
+        assert_eq!(
+            view_profile(1080, 1920, true),
+            (404, 720, Duration::from_millis(33))
+        );
     }
 
     #[test]

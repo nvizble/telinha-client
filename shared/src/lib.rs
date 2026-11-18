@@ -316,14 +316,19 @@ impl Quality {
     }
     pub fn fit(self, w: u32, h: u32) -> (u32, u32) {
         let (max_w, max_h) = self.dimensions();
-        let scale = (max_w as f64 / w.max(1) as f64)
-            .min(max_h as f64 / h.max(1) as f64)
-            .min(1.0);
-        (
-            ((w as f64 * scale) as u32 & !1).max(2),
-            ((h as f64 * scale) as u32 & !1).max(2),
-        )
+        fit_video(w, h, max_w, max_h)
     }
+}
+
+/// Fit even-sized video within a bounding box without stretching or upscaling.
+pub fn fit_video(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    let scale = (max_w as f64 / w.max(1) as f64)
+        .min(max_h as f64 / h.max(1) as f64)
+        .min(1.0);
+    (
+        ((w as f64 * scale) as u32 & !1).max(2),
+        ((h as f64 * scale) as u32 & !1).max(2),
+    )
 }
 
 #[cfg(test)]

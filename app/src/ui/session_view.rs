@@ -77,8 +77,11 @@ impl Telinha {
 
     pub(super) fn stage(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let camera_count = self.camera_count();
-        let camera_gallery =
-            camera_count > 0 && self.streams.is_empty() && self.publishing.is_none();
+        let camera_focused = self.camera_focus.participant().is_some();
+        let camera_gallery = camera_count > 0
+            && self.streams.is_empty()
+            && self.publishing.is_none()
+            && !camera_focused;
         let mut well = div()
             .flex_1()
             .min_w_0()
@@ -90,7 +93,75 @@ impl Telinha {
             .justify_center()
             .overflow_hidden()
             .when(!self.fullscreen, |well| well.rounded(px(10.)));
-        if let Some(image) = if self.local_preview {
+        if self.gallery {
+            well = well.child(self.gallery_view(window, cx));
+        } else if camera_focused {
+            if let Some(image) = self
+                .camera_focus
+                .track()
+                .and_then(|id| self.camera_images.get(id))
+            {
+                well = well.bg(rgb(0)).child(
+                    img(image.clone())
+                        .size_full()
+                        .object_fit(ObjectFit::Contain),
+                );
+            } else {
+                well = well.child(empty_state(
+                    "icons/camera.svg",
+                    if self.camera_focus.track().is_some() {
+                        "Recebendo a webcam"
+                    } else {
+                        "A webcam foi interrompida"
+                    },
+                    "Escolha outra webcam ou transmissão para assistir.",
+                ));
+            }
+            if !self.fullscreen || self.ghost_visible {
+                let opacity = if self.fullscreen {
+                    0.22 * (1.0
+                        - ((self.mouse_at.elapsed().as_secs_f32() - 5.0) / 0.35).clamp(0.0, 1.0))
+                } else {
+                    1.0
+                };
+                well = well.child(
+                    div()
+                        .absolute()
+                        .left(px(24.))
+                        .bottom(px(if self.fullscreen && self.controls_visible {
+                            104.
+                        } else {
+                            24.
+                        }))
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .opacity(opacity)
+                        .when(!self.fullscreen, |label| {
+                            label
+                                .px_3()
+                                .py_2()
+                                .rounded(px(8.))
+                                .bg(gpui::rgba(0x17181AD9))
+                        })
+                        .child(
+                            svg()
+                                .path("logo.svg")
+                                .w(px(53.))
+                                .h(px(17.))
+                                .text_color(rgb(FG)),
+                        )
+                        .child(div().w(px(1.)).h(px(13.)).bg(rgb(FG)).opacity(0.7))
+                        .child(
+                            div()
+                                .max_w(px(220.))
+                                .text_size(px(12.))
+                                .truncate()
+                                .child(self.camera_focus_title.clone()),
+                        ),
+                );
+            }
+        } else if let Some(image) = if self.local_preview {
             &self.local_preview_image
         } else {
             &self.image
@@ -248,7 +319,7 @@ impl Telinha {
                     .grid()
                     .grid_cols(columns as u16)
                     .gap_3()
-                    .children(self.camera_tiles(height)),
+                    .children(self.camera_tiles(height, cx)),
             );
         } else if !self.streams.is_empty() {
             let waiting = self.stream_selection.track().is_none() && !self.reconnecting;
@@ -398,7 +469,11 @@ impl Telinha {
             .gap_3()
             .when(!self.fullscreen, |stage| stage.mx_4())
             .child(well);
-        if (!self.fullscreen && self.streams.len() > 1) || (camera_count > 0 && !camera_gallery) {
+        if !self.gallery
+            && !self.fullscreen
+            && ((!self.streams.is_empty() && camera_focused || self.streams.len() > 1)
+                || (camera_count > 0 && !camera_gallery))
+        {
             let mut list = div()
                 .id("stream-list")
                 .w(px(if camera_count > 0 { 220. } else { 184. }))
@@ -420,10 +495,14 @@ impl Telinha {
                 });
             for stream in self.streams.iter().filter(|_| !self.fullscreen) {
                 let id = stream.id.clone();
-                let active = self.backend.media.selected_track.lock().as_ref() == Some(&id);
+                let active = !camera_focused
+                    && !self.local_preview
+                    && self.backend.media.selected_track.lock().as_ref() == Some(&id);
                 list = list.child(
                     div()
                         .id(SharedString::from(id.clone()))
+                        .flex_shrink_0()
+                        .min_h(px(96.))
                         .p_3()
                         .rounded(px(8.))
                         .border_1()
@@ -466,6 +545,7 @@ impl Telinha {
                                 }),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
                             this.select_stream(Some(id.clone()), cx)
                         })),
                 );
@@ -480,7 +560,7 @@ impl Telinha {
                             .text_color(rgb(MUTED))
                             .child(format!("Webcams · {camera_count}")),
                     )
-                    .children(self.camera_tiles(150.));
+                    .children(self.camera_tiles(150., cx));
             }
             stage = stage.child(list);
         }
@@ -565,11 +645,35 @@ impl Telinha {
             .flex()
             .items_center()
             .gap_3()
+            .when(compact, |row| row.gap_2())
             .when(self.fullscreen, |row| {
                 row.bg(gpui::rgba(0x2A2C30F2)).rounded(px(12.))
             });
-        if !self.streams.is_empty() || self.local_preview {
+        if !self.streams.is_empty()
+            || self.local_preview
+            || self.gallery
+            || self.camera_count() > 0
+            || self.camera_focus.participant().is_some()
+            || self.fullscreen
+        {
             row = row
+                .child(
+                    button_with_icon(
+                        "view-layout",
+                        if self.gallery { "Destaque" } else { "Galeria" },
+                        if self.gallery {
+                            "icons/monitor.svg"
+                        } else {
+                            "icons/gallery.svg"
+                        },
+                        false,
+                    )
+                    .px_3()
+                    .when(self.gallery, |button| {
+                        button.border_color(rgb(FG)).bg(rgb(PANEL))
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.set_gallery(!this.gallery, cx))),
+                )
                 .child(
                     button_with_icon(
                         "mute",
@@ -622,8 +726,12 @@ impl Telinha {
                         false,
                     )
                     .on_click(cx.listener(|this, _, window, cx| {
-                        window.toggle_fullscreen();
-                        this.fullscreen = !this.fullscreen;
+                        if this.fullscreen {
+                            this.exit_fullscreen(window, cx);
+                        } else {
+                            window.toggle_fullscreen();
+                            this.fullscreen = true;
+                        }
                         this.controls_visible = true;
                         this.ghost_visible = true;
                         this.mouse_at = Instant::now();
@@ -632,17 +740,33 @@ impl Telinha {
                 );
         }
         if self.publishing.is_some() {
+            let measured = self.quality_status.as_ref();
+            let fps = measured
+                .and_then(|s| s.sent_fps)
+                .map(|fps| format!("{fps:.0} fps"))
+                .unwrap_or_else(|| format!("{} fps", self.fps));
+            let detail = measured
+                .filter(|s| s.width > 0)
+                .map(|s| {
+                    if !compact && let Some(bitrate) = s.bitrate {
+                        format!(
+                            "{}×{} · {:.1} Mb/s",
+                            s.width,
+                            s.height,
+                            bitrate as f64 / 1_000_000.
+                        )
+                    } else {
+                        format!("{}×{}", s.width, s.height)
+                    }
+                })
+                .unwrap_or_else(|| self.quality.label().to_owned());
             row = row.child(live_badge()).child(
                 div()
                     .flex()
                     .flex_col()
                     .gap(px(2.))
-                    .child(div().text_sm().child(format!("{} fps", self.fps)))
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(if compact {
-                        "capturados"
-                    } else {
-                        self.quality.label()
-                    })),
+                    .child(div().text_sm().child(fps))
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(detail)),
             );
         } else if self.streams.is_empty() && !compact {
             row = row.child(
@@ -752,7 +876,11 @@ impl Telinha {
     }
 }
 
-fn empty_state(path: &'static str, title: &'static str, description: &'static str) -> Div {
+pub(super) fn empty_state(
+    path: &'static str,
+    title: &'static str,
+    description: &'static str,
+) -> Div {
     div()
         .flex()
         .flex_col()

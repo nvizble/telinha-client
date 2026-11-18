@@ -3,6 +3,7 @@
     windows_subsystem = "windows"
 )]
 mod account;
+mod adaptive;
 mod app_icon;
 mod audio;
 mod camera;

@@ -18,7 +18,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -67,6 +67,7 @@ pub enum Event {
     StreamSound(crate::sounds::Cue),
     Publishing(Option<String>),
     CaptureFps(u64),
+    QualityStatus(crate::adaptive::Status),
     Cameras {
         request: u64,
         result: Result<Vec<camera::Device>, String>,
@@ -113,7 +114,7 @@ pub enum Command {
     Share {
         source: Source,
         quality: Quality,
-        audio: Option<audio::Application>,
+        audio: Option<audio::Source>,
     },
     StopSharing,
     CancelShare,
@@ -133,7 +134,7 @@ enum SessionCommand {
     Share {
         source: Source,
         quality: Quality,
-        audio: Option<audio::Application>,
+        audio: Option<audio::Source>,
     },
     Stop,
     CancelShare,
@@ -153,6 +154,9 @@ pub struct MediaState {
     pub selected_track: Arc<Mutex<Option<String>>>,
     pub selected_participant: Arc<Mutex<Option<String>>>,
     pub cameras: Arc<Mutex<HashMap<String, Pixels>>>,
+    pub focused_camera: Arc<Mutex<Option<String>>>,
+    pub gallery: Arc<AtomicBool>,
+    pub screens: Arc<Mutex<HashMap<String, Pixels>>>,
 }
 pub struct Backend {
     pub updates: crate::updates::Status,
@@ -204,6 +208,9 @@ impl Backend {
                                 code,
                                 guest_name,
                             } => {
+                                *worker_media.focused_camera.lock() = None;
+                                worker_media.gallery.store(false, Ordering::Relaxed);
+                                worker_media.screens.lock().clear();
                                 if let Some(task) = source_task.take() {
                                     task.abort();
                                 }
@@ -231,6 +238,9 @@ impl Backend {
                                 ));
                             }
                             Command::Leave => {
+                                *worker_media.focused_camera.lock() = None;
+                                worker_media.gallery.store(false, Ordering::Relaxed);
+                                worker_media.screens.lock().clear();
                                 if let Some(task) = source_task.take() {
                                     task.abort();
                                 }
@@ -562,11 +572,13 @@ impl Drop for RemoteTasks {
 }
 struct Sharing {
     capture: Capture,
+    track: LocalVideoTrack,
+    _adaptive: crate::adaptive::Worker,
     _preview: crate::local_preview::Worker,
     #[cfg(target_os = "windows")]
     _audio: Option<audio::windows::ProcessAudio>,
     #[cfg(target_os = "windows")]
-    audio_application: Option<audio::Application>,
+    audio_application: Option<audio::Source>,
 }
 
 async fn unpublish(room: &Room, sharing: &mut Option<Sharing>, events: &Events) {
@@ -620,7 +632,7 @@ async fn connected(
     let mut camera_request = 0;
     let mut preparing_camera = tokio::task::JoinSet::new();
     let (camera_faults, mut camera_errors) = mpsc::unbounded_channel();
-    let mut camera_tick = tokio::time::interval(Duration::from_millis(67));
+    let mut camera_tick = tokio::time::interval(Duration::from_millis(33));
     loop {
         tokio::select! {
             command = commands.recv() => match command {
@@ -670,11 +682,12 @@ async fn connected(
                             if let Some(current) = &mut sharing {
                                 capture.replace(&current.capture);
                                 current.capture = capture;
+                                current._adaptive = crate::adaptive::Worker::start(current.track.clone(), current.capture.control.clone());
                                 capture_faults = receiver;
                                 previous_frames = 0;
                                 events.send(Event::Publishing(Some(source.name)));
                                 #[cfg(target_os = "windows")]
-                                if current.audio_application != audio {
+                                if current.audio_application != audio || (audio.is_some() && current._audio.is_none()) {
                                     current._audio.take();
                                     unpublish_audio(room).await;
                                     let (faults, receiver) = mpsc::unbounded_channel();
@@ -731,6 +744,11 @@ async fn connected(
                 events.send(Event::CameraError { request, message });
             },
             _ = camera_tick.tick(), if webcam.is_some() => {
+                if let Some(webcam) = &webcam {
+                    webcam.capture.preview_focused.store(
+                        !media.gallery.load(Ordering::Relaxed) && media.focused_camera.lock().as_deref() == Some(&webcam.id), Ordering::Relaxed,
+                    );
+                }
                 if let Some(webcam) = &webcam && let Some(frame) = webcam.capture.preview.lock().take() {
                     media.cameras.lock().insert(webcam.id.clone(), Pixels { track: webcam.id.clone(), width: frame.width, height: frame.height, bgra: frame.bgra });
                 }
@@ -752,6 +770,7 @@ async fn connected(
             _ = tick.tick() => if let Some(sharing) = &sharing {
                 let frames = sharing.capture.frames.load(Ordering::Relaxed);
                 events.send(Event::CaptureFps(frames.saturating_sub(previous_frames))); previous_frames = frames;
+                events.send(Event::QualityStatus(sharing.capture.control.status()));
             },
             event = room_events.recv() => {
                 // Publication events describe actual starts/stops. Subscription
@@ -781,19 +800,32 @@ async fn connected(
                                 let media = media.clone(); let stream_id = sid.clone();
                                 tasks.0.insert(sid, tokio::spawn(async move {
                                     let mut stream = NativeVideoStream::new(track.rtc_track());
-                                    let mut last_camera = Instant::now() - Duration::from_secs(1);
+                                    let mut last_preview = Instant::now() - Duration::from_secs(1);
                                     while let Some(frame) = stream.next().await {
-                                        if kind == VideoKind::Screen && media.selected_track.lock().as_deref() != Some(&stream_id) { continue; }
-                                        if kind == VideoKind::Camera && last_camera.elapsed() < Duration::from_millis(66) { continue; }
+                                        let focus = media.focused_camera.lock().clone();
+                                        let gallery = media.gallery.load(Ordering::Relaxed);
+                                        if kind == VideoKind::Screen && !gallery && (focus.is_some() || media.selected_track.lock().as_deref() != Some(&stream_id)) { continue; }
+                                        let (preview_width, preview_height, interval) = if kind == VideoKind::Camera {
+                                            camera::view_profile(frame.buffer.width(), frame.buffer.height(), !gallery && focus.as_deref() == Some(&stream_id))
+                                        } else {
+                                            let (width, height) = camera::fit(frame.buffer.width(), frame.buffer.height(), 640, 360);
+                                            (width, height, Duration::from_millis(100))
+                                        };
+                                        if (kind == VideoKind::Camera || gallery) && last_preview.elapsed() < interval { continue; }
                                         let mut buffer = frame.buffer.to_i420();
-                                        let (width,height) = if kind == VideoKind::Camera { camera::fit(frame.buffer.width(),frame.buffer.height(),640,480) } else { Quality::FullHd30.fit(frame.buffer.width(),frame.buffer.height()) };
+                                        let (width,height) = if kind == VideoKind::Camera || gallery { (preview_width, preview_height) } else { Quality::FullHd30.fit(frame.buffer.width(),frame.buffer.height()) };
                                         if (width,height) != (frame.buffer.width(), frame.buffer.height()) { buffer = buffer.scale(width as i32,height as i32); }
                                         let mut bgra = vec![0; width as usize * height as usize * 4];
                                         buffer.to_argb(VideoFormatType::ARGB, &mut bgra, width * 4, width as i32, height as i32);
                                         let pixels = Pixels { track: stream_id.clone(), width, height, bgra };
                                         if kind == VideoKind::Camera {
-                                            last_camera = Instant::now();
+                                            last_preview = Instant::now();
                                             media.cameras.lock().insert(stream_id.clone(), pixels);
+                                        } else if gallery {
+                                            last_preview = Instant::now();
+                                            if media.gallery.load(Ordering::Relaxed) {
+                                                media.screens.lock().insert(stream_id.clone(), pixels);
+                                            }
                                         } else {
                                             // Selection may have changed while converting this frame.
                                             let selected = media.selected_track.lock();
@@ -817,6 +849,7 @@ async fn connected(
                         let sid = publication.sid().to_string();
                         if let Some(task) = tasks.0.remove(&sid) { task.abort(); }
                         media.cameras.lock().remove(&sid);
+                        media.screens.lock().remove(&sid);
                         let mut latest = media.latest.lock();
                         if latest.as_ref().is_some_and(|frame| frame.track == sid) { latest.take(); }
                         drop(latest);
@@ -828,6 +861,7 @@ async fn connected(
                         let sid = publication.sid().to_string();
                         if let Some(task) = tasks.0.remove(&sid) { task.abort(); }
                         media.cameras.lock().remove(&sid);
+                        media.screens.lock().remove(&sid);
                         let mut latest = media.latest.lock();
                         if latest.as_ref().is_some_and(|frame| frame.track == sid) { latest.take(); }
                         drop(latest);
@@ -895,7 +929,7 @@ async fn publish(
     capture: Capture,
     source: Source,
     quality: Quality,
-    audio_application: Option<audio::Application>,
+    audio_application: Option<audio::Source>,
     context: PublishContext<'_>,
 ) -> anyhow::Result<Sharing> {
     let PublishContext {
@@ -935,8 +969,11 @@ async fn publish(
     let audio = publish_audio(room, audio_application.clone(), audio_faults, events).await;
     #[cfg(not(target_os = "windows"))]
     let _ = (audio_application, audio_faults, events);
+    let adaptive = crate::adaptive::Worker::start(track.clone(), capture.control.clone());
     Ok(Sharing {
         capture,
+        track: track.clone(),
+        _adaptive: adaptive,
         _preview: crate::local_preview::Worker::start(track, preview.clone()),
         #[cfg(target_os = "windows")]
         _audio: audio,
@@ -961,15 +998,19 @@ async fn unpublish_audio(room: &Room) {
 #[cfg(target_os = "windows")]
 async fn publish_audio(
     room: &Room,
-    audio_application: Option<audio::Application>,
+    audio_application: Option<audio::Source>,
     audio_faults: mpsc::UnboundedSender<String>,
     events: &Events,
 ) -> Option<audio::windows::ProcessAudio> {
     if let Some(application) = audio_application {
+        let name = match &application {
+            audio::Source::Desktop => "Áudio do desktop",
+            audio::Source::Application(_) => "Áudio do aplicativo",
+        };
         let result = async {
             let capture = audio::windows::ProcessAudio::start(application, audio_faults).await?;
             let track = livekit::track::LocalAudioTrack::create_audio_track(
-                "Áudio do aplicativo",
+                name,
                 livekit::webrtc::audio_source::RtcAudioSource::Native(capture.source.clone()),
             );
             tokio::time::timeout(

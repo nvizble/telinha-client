@@ -369,7 +369,7 @@ impl Telinha {
                 .mb_1()
                 .text_size(px(12.))
                 .font_weight(FontWeight::SEMIBOLD)
-                .child("Qualidade da transmissão"),
+                .child("Qualidade máxima"),
         );
         for (index, (quality, note)) in [
             (Quality::FullHd60, "Mais fluidez"),
@@ -439,6 +439,8 @@ impl Telinha {
             || !cfg!(target_os = "windows")
         {
             "sem áudio".to_owned()
+        } else if self.audio_selection == audio_selection::Selection::Desktop {
+            "áudio do desktop".to_owned()
         } else if let Some(application) = self.selected_audio_application() {
             format!("áudio de {}", application.name)
         } else {
@@ -613,13 +615,16 @@ impl Telinha {
             .border_color(rgb(LINE))
             .flex()
             .gap(px(2.));
-        for (index, label) in ["Da janela", "Outro app", "Sem áudio"]
+        for (index, label) in ["Da janela", "Outro app", "Desktop", "Sem áudio"]
             .into_iter()
             .enumerate()
         {
             let selected = matches!(
                 (index, self.audio_selection),
-                (0, Selection::FollowWindow) | (1, Selection::Application(_)) | (2, Selection::Off)
+                (0, Selection::FollowWindow)
+                    | (1, Selection::Application(_))
+                    | (2, Selection::Desktop)
+                    | (3, Selection::Off)
             );
             let unavailable = disabled || (index == 0 && !can_follow);
             modes = modes.child(
@@ -656,6 +661,10 @@ impl Telinha {
                                 }
                                 this.audio_apps_open = true;
                             }
+                            2 => {
+                                this.audio_selection = Selection::Desktop;
+                                this.audio_apps_open = false;
+                            }
                             _ => {
                                 this.audio_selection = Selection::Off;
                                 this.audio_apps_open = false;
@@ -668,6 +677,8 @@ impl Telinha {
         let other = matches!(self.audio_selection, Selection::Application(_));
         let title = if self.audio_selection == Selection::Off {
             "Compartilhar sem som".into()
+        } else if self.audio_selection == Selection::Desktop {
+            "Desktop inteiro".into()
         } else {
             self.selected_audio_application()
                 .map(|a| a.name.clone())
@@ -675,6 +686,8 @@ impl Telinha {
         };
         let note = if self.audio_selection == Selection::Off {
             "A voz continua no Discord"
+        } else if self.audio_selection == Selection::Desktop {
+            "Som dos aplicativos abertos"
         } else if other {
             "Somente deste aplicativo"
         } else {
@@ -684,6 +697,7 @@ impl Telinha {
             .audio_selection_warning
             .unwrap_or(match self.audio_selection {
                 Selection::Off => "Só a imagem será transmitida.",
+                Selection::Desktop => "Discord e Telinha excluídos. Evite Discord no navegador.",
                 Selection::FollowWindow => "Seus amigos ouvem só a janela escolhida.",
                 Selection::Application(_) => "Discord e Telinha ficam fora das fontes de áudio.",
             });
@@ -728,6 +742,8 @@ impl Telinha {
                     .child(icon(
                         if self.audio_selection == Selection::Off {
                             "icons/mute.svg"
+                        } else if self.audio_selection == Selection::Desktop {
+                            "icons/monitor.svg"
                         } else {
                             "icons/window.svg"
                         },

@@ -29,7 +29,7 @@ tracing-subscriber.workspace = true
 nokhwa = { version = "=0.10.11", default-features = false, features = ["input-msmf"] }
 wasapi = "=0.27.0"
 winreg = "0.55"
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_System_LibraryLoader"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_Diagnostics_ToolHelp"] }
 raw-window-handle = "0.6"
 
 [build-dependencies]

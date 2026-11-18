@@ -11,6 +11,10 @@ use std::{
     },
 };
 
+#[cfg(target_os = "windows")]
+mod desktop;
+#[cfg(any(target_os = "windows", test))]
+mod mix;
 #[cfg(any(target_os = "windows", test))]
 mod policy;
 #[cfg(target_os = "windows")]
@@ -24,6 +28,12 @@ pub struct Application {
     pub process_id: u32,
     pub created_at: u64,
     pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Source {
+    Application(Application),
+    Desktop,
 }
 
 /// Called alongside window enumeration on a background worker, never while rendering.
@@ -148,6 +158,13 @@ pub mod windows {
     use std::{borrow::Cow, time::Duration};
     use wasapi::{AudioClient, Direction, SampleType, StreamMode, WaveFormat};
 
+    struct Com;
+    impl Drop for Com {
+        fn drop(&mut self) {
+            wasapi::deinitialize();
+        }
+    }
+
     pub struct ProcessAudio {
         pub source: NativeAudioSource,
         stop: Arc<AtomicBool>,
@@ -162,7 +179,7 @@ pub mod windows {
 
     impl ProcessAudio {
         pub async fn start(
-            application: Application,
+            selection: Source,
             faults: tokio::sync::mpsc::UnboundedSender<String>,
         ) -> anyhow::Result<Self> {
             let stop = Arc::new(AtomicBool::new(false));
@@ -186,13 +203,20 @@ pub mod windows {
                 .spawn(move || {
                     let mut ready_tx = Some(ready_tx);
                     let result = (|| -> anyhow::Result<()> {
+                        wasapi::initialize_mta().ok()?;
+                        let _com = Com;
+                        let application = match selection {
+                            Source::Desktop => {
+                                return desktop::run(&worker_stop, &pcm_tx, &mut ready_tx);
+                            }
+                            Source::Application(application) => application,
+                        };
                         // Open and keep the original process on this worker. Never resolve a
                         // stale window into a different application's PID or use system loopback.
                         let target = target::Target::open(&application)?;
                         if worker_stop.load(Ordering::Relaxed) {
                             return Ok(());
                         }
-                        wasapi::initialize_mta().ok()?;
                         let mut client = AudioClient::new_application_loopback_client(
                             target.process_id(),
                             true,
@@ -257,7 +281,7 @@ pub mod windows {
                         if worker_stop.load(Ordering::Relaxed) {
                             return;
                         }
-                        let message = format!("Não deu pra capturar o som deste programa: {error}");
+                        let message = format!("Não deu pra capturar o áudio escolhido: {error}");
                         if let Some(tx) = ready_tx.take() {
                             let _ = tx.send(Err(message));
                         } else {
@@ -288,7 +312,7 @@ pub mod windows {
             tokio::time::timeout(Duration::from_secs(10), ready_rx)
                 .await
                 .context("A captura de áudio demorou demais.")?
-                .context("Não deu pra iniciar o áudio deste programa.")?
+                .context("Não deu pra iniciar o áudio escolhido.")?
                 .map_err(anyhow::Error::msg)?;
             Ok(capture)
         }

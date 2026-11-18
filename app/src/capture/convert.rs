@@ -1,5 +1,6 @@
 use anyhow::ensure;
 use livekit::webrtc::{native::yuv_helper, prelude::I420Buffer};
+#[cfg(test)]
 use telinha_shared::Quality;
 
 // libyuv is already linked by the pinned webrtc-sys dependency. Its C API
@@ -25,6 +26,7 @@ pub(super) struct Converter {
 }
 
 impl Converter {
+    #[cfg(test)]
     pub(super) fn convert(
         &mut self,
         w: i32,
@@ -32,6 +34,17 @@ impl Converter {
         stride: u32,
         data: &[u8],
         quality: Quality,
+    ) -> anyhow::Result<I420Buffer> {
+        self.convert_to(w, h, stride, data, quality.dimensions())
+    }
+
+    pub(super) fn convert_to(
+        &mut self,
+        w: i32,
+        h: i32,
+        stride: u32,
+        data: &[u8],
+        dimensions: (u32, u32),
     ) -> anyhow::Result<I420Buffer> {
         ensure!(
             (1..=16384).contains(&w) && (1..=16384).contains(&h),
@@ -45,7 +58,8 @@ impl Converter {
                     .is_some_and(|len| data.len() >= len),
             "O quadro de captura chegou incompleto."
         );
-        let (width, height) = quality.fit(w as u32, h as u32);
+        let (width, height) =
+            telinha_shared::fit_video(w as u32, h as u32, dimensions.0, dimensions.1);
         // Small resizes benefit from libyuv's specialized I420 paths. For a
         // large reduction, avoid allocating/converting a full-resolution I420
         // frame: shrink BGRA first, reusing scratch storage. Odd source sizes

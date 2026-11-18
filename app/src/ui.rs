@@ -17,6 +17,7 @@ use telinha_shared::{CODE_ALPHABET, CallStatus, CallUnavailable, DiscordCall, Qu
 mod audio_selection;
 mod cameras;
 mod feedback;
+mod gallery;
 mod guest;
 mod home;
 mod people;
@@ -75,8 +76,12 @@ pub struct Telinha {
     participants_open: bool,
     streams: Vec<RemoteStream>,
     stream_selection: crate::stream_selection::Selection,
+    gallery: bool,
+    screen_images: HashMap<String, Arc<RenderImage>>,
     cameras: Vec<RemoteStream>,
     camera_images: HashMap<String, Arc<RenderImage>>,
+    camera_focus: crate::stream_selection::Selection,
+    camera_focus_title: String,
     camera_devices: Vec<crate::camera::Device>,
     camera_picker: bool,
     camera_loading: bool,
@@ -99,6 +104,7 @@ pub struct Telinha {
     source_previews: HashMap<usize, Arc<RenderImage>>,
     source_preview_done: HashSet<usize>,
     quality: Quality,
+    quality_status: Option<crate::adaptive::Status>,
     audio_sources: Vec<crate::audio::Application>,
     audio_selection: audio_selection::Selection,
     sharing_audio: audio_selection::Selection,
@@ -165,8 +171,12 @@ impl Telinha {
             participants_open: false,
             streams: vec![],
             stream_selection: crate::stream_selection::Selection::default(),
+            gallery: false,
+            screen_images: HashMap::new(),
             cameras: vec![],
             camera_images: HashMap::new(),
+            camera_focus: crate::stream_selection::Selection::default(),
+            camera_focus_title: String::new(),
             camera_devices: vec![],
             camera_picker: false,
             camera_loading: false,
@@ -189,6 +199,7 @@ impl Telinha {
             source_previews: HashMap::new(),
             source_preview_done: HashSet::new(),
             quality: Quality::FullHd30,
+            quality_status: None,
             audio_sources: vec![],
             sharing_audio: audio_selection::Selection::Off,
             audio_selection: if cfg!(target_os = "windows") {
@@ -294,6 +305,9 @@ impl Telinha {
                     }
                 }
                 crate::account::Event::SignedOut { clear_saved } => {
+                    if self.auto_join.active.is_some() {
+                        self.leave_session(cx);
+                    }
                     self.call_status = None;
                     self.call_error = None;
                     self.call_inflight = false;
@@ -506,6 +520,10 @@ impl Telinha {
                     }
                     let id = stream.id.clone();
                     if stream.kind == VideoKind::Camera {
+                        if self.camera_focus.added(&stream) {
+                            self.camera_focus_title = stream.title.clone();
+                            self.sync_camera_focus();
+                        }
                         self.cameras.retain(|s| s.id != id);
                         self.cameras.push(stream);
                         continue;
@@ -518,12 +536,15 @@ impl Telinha {
                     }
                 }
                 Event::StreamPaused(id) => {
+                    self.drop_screen_image(&id, cx);
                     self.drop_camera_image(&id, cx);
-                    if self.stream_selection.track() == Some(&id) {
+                    if self.stream_selection.removed(&id) {
+                        self.stream_selection.recover(&self.streams, &id);
                         self.sync_stream_selection(cx);
                     }
                 }
                 Event::StreamRemoved(id) => {
+                    self.drop_screen_image(&id, cx);
                     self.cameras.retain(|s| s.id != id);
                     self.drop_camera_image(&id, cx);
                     let selected = self.stream_selection.removed(&id);
@@ -532,6 +553,7 @@ impl Telinha {
                     }
                     self.streams.retain(|s| s.id != id);
                     if selected {
+                        self.stream_selection.recover(&self.streams, &id);
                         self.sync_stream_selection(cx);
                     }
                 }
@@ -550,11 +572,13 @@ impl Telinha {
                     }
                     let had_preview = self.local_preview;
                     self.set_publishing(name);
+                    self.sync_preview_enabled();
                     if had_preview && !self.local_preview {
                         self.sync_stream_selection(cx);
                     }
                 }
                 Event::CaptureFps(fps) => self.fps = fps,
+                Event::QualityStatus(status) => self.quality_status = Some(status),
                 Event::Cameras { request, result } => {
                     if request != self.camera_request || !self.camera_picker {
                         continue;
@@ -578,6 +602,7 @@ impl Telinha {
                         self.camera_picker = false;
                     }
                     self.camera_publishing = stream;
+                    self.refresh_own_camera_focus();
                 }
                 Event::CameraError { request, message } => {
                     if request != self.camera_request {
@@ -602,6 +627,16 @@ impl Telinha {
                     .is_ok();
                 self.next_call_check = Instant::now() + Duration::from_secs(3);
             }
+            if self
+                .call_status
+                .as_ref()
+                .is_some_and(|status| self.auto_join.departed(status))
+            {
+                // A confirmed exit/move ends capture even while connecting or a picker is open.
+                self.leave_session(cx);
+                self.toast("Você saiu da call do Discord. A sessão foi encerrada.".into());
+                changed = true;
+            }
             if let Some(status) = &self.call_status
                 && let Some(call) = self.auto_join.next(
                     status,
@@ -619,7 +654,7 @@ impl Telinha {
                 changed = true;
             }
         }
-        if self.local_preview {
+        if self.local_preview || self.gallery && self.publishing.is_some() {
             if let Some(frame) = self.backend.media.preview.take()
                 && let Some(buffer) =
                     image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra)
@@ -644,6 +679,20 @@ impl Telinha {
                 cx.drop_image(previous, None);
             }
             changed = true;
+        }
+        let screen_frames = std::mem::take(&mut *self.backend.media.screens.lock());
+        for (id, frame) in screen_frames {
+            if self.gallery
+                && self.streams.iter().any(|s| s.id == id)
+                && let Some(buffer) =
+                    image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra)
+            {
+                let new = Arc::new(RenderImage::new([image::Frame::new(buffer)]));
+                if let Some(previous) = self.screen_images.insert(id, new) {
+                    cx.drop_image(previous, None);
+                }
+                changed = true;
+            }
         }
         let camera_frames = std::mem::take(&mut *self.backend.media.cameras.lock());
         for (id, frame) in camera_frames {
@@ -787,6 +836,11 @@ impl Telinha {
         self.open_link(&input, cx);
     }
     fn leave(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_session(cx);
+        self.exit_fullscreen(window, cx);
+    }
+
+    fn leave_session(&mut self, cx: &mut Context<Self>) {
         self.feedback.end(
             self.generation,
             crate::feedback::Reason::Left,
@@ -807,13 +861,10 @@ impl Telinha {
         self.reset_cameras(cx);
         self.reconnecting = false;
         self.select_stream(None, cx);
-        if self.fullscreen {
-            window.toggle_fullscreen();
-            self.fullscreen = false;
-        }
         cx.notify();
     }
     fn set_publishing(&mut self, name: Option<String>) {
+        self.quality_status = None;
         if name.is_none() {
             self.local_preview = false;
             self.backend.media.preview.set_enabled(false);
@@ -830,15 +881,23 @@ impl Telinha {
     }
 
     fn select_stream(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        // A click can arrive after its card was removed. Keep the current choice
+        // instead of resetting ownership and letting the next event pick a stream.
+        let stream = match &id {
+            Some(id) => match self.streams.iter().find(|s| &s.id == id).cloned() {
+                Some(stream) => Some(stream),
+                None => return,
+            },
+            None => None,
+        };
+        self.set_gallery(false, cx);
+        self.clear_camera_focus();
         self.local_preview = false;
         self.backend.media.preview.set_enabled(false);
         if let Some(image) = self.local_preview_image.take() {
             cx.drop_image(image, None);
         }
-        let stream = id
-            .as_ref()
-            .and_then(|id| self.streams.iter().find(|s| &s.id == id));
-        self.stream_selection.choose(stream);
+        self.stream_selection.choose(stream.as_ref());
         self.sync_stream_selection(cx);
     }
 
@@ -869,8 +928,12 @@ impl Telinha {
         let _ = self.backend.commands.send(Command::StopSourcePreviews);
     }
     fn set_local_preview(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if enabled {
+            self.set_gallery(false, cx);
+            self.clear_camera_focus();
+        }
         self.local_preview = enabled && self.publishing.is_some();
-        self.backend.media.preview.set_enabled(self.local_preview);
+        self.sync_preview_enabled();
         if let Some(image) = self.local_preview_image.take() {
             cx.drop_image(image, None);
         }
@@ -938,7 +1001,10 @@ impl Telinha {
     }
     fn audio_selection_ready(&self) -> bool {
         !cfg!(target_os = "windows")
-            || self.audio_selection == audio_selection::Selection::Off
+            || matches!(
+                self.audio_selection,
+                audio_selection::Selection::Off | audio_selection::Selection::Desktop
+            )
             || self.selected_audio_application().is_some()
     }
     fn update_audio_for_source(&mut self) {
@@ -950,8 +1016,7 @@ impl Telinha {
             && self.audio_selection.select_display()
         {
             self.audio_apps_open = true;
-            self.audio_selection_warning =
-                Some("Escolha um aplicativo para o áudio, ou use Sem áudio.");
+            self.audio_selection_warning = Some("Escolha Outro app, Desktop ou Sem áudio.");
         }
     }
     fn share(&mut self, cx: &mut Context<Self>) {
@@ -967,7 +1032,15 @@ impl Telinha {
             self.error = None;
             let _ = self.backend.commands.send(Command::StopSourcePreviews);
             let _ = self.backend.commands.send(Command::Share {
-                audio: self.selected_audio_application().cloned(),
+                audio: if cfg!(target_os = "windows")
+                    && self.audio_selection == audio_selection::Selection::Desktop
+                {
+                    Some(crate::audio::Source::Desktop)
+                } else {
+                    self.selected_audio_application()
+                        .cloned()
+                        .map(crate::audio::Source::Application)
+                },
                 source,
                 quality: self.quality,
             });
@@ -1086,8 +1159,7 @@ impl Telinha {
             } else if self.account_menu_open {
                 self.account_menu_open = false;
             } else if self.fullscreen {
-                window.toggle_fullscreen();
-                self.fullscreen = false;
+                self.exit_fullscreen(window, cx);
             } else if self.camera_picker {
                 self.stop_camera(cx);
             } else if self.picker && !self.starting {
@@ -1378,68 +1450,24 @@ impl Telinha {
         row.into_any_element()
     }
 
-    fn call_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let active = self.auto_join.active.as_ref()?;
-        let mut destination = None;
-        let message =
-            match &self.call_status {
-                Some(CallStatus::InCall { call }) if call.room == active.room => return None,
-                Some(CallStatus::InCall { call }) => {
-                    destination = Some(call.clone());
-                    format!(
-                        "Você mudou para # {}. Sua sessão em # {} continua aberta.",
-                        call.channel_name, active.channel_name
-                    )
-                }
-                Some(CallStatus::Waiting) => {
-                    "Você saiu da call do Discord. Sua sessão continua aberta.".into()
-                }
-                Some(CallStatus::Multiple { .. }) => {
-                    "Há mais de uma call. Sua sessão atual continua aberta.".into()
-                }
-                _ => {
-                    return Some(banner(
-                    "Não foi possível conferir a call do Discord. Sua sessão continua aberta.",
+    fn call_notice(&self) -> Option<AnyElement> {
+        self.auto_join.active.as_ref()?;
+        if self.call_error.is_some()
+            || matches!(
+                self.call_status,
+                None | Some(CallStatus::Unavailable { .. })
+            )
+        {
+            Some(
+                banner(
+                    "Não foi possível conferir a call do Discord. Tentando novamente…",
                     false,
-                ).into_any_element());
-                }
-            };
-        let mut row = div()
-            .px_4()
-            .py_2()
-            .flex()
-            .items_center()
-            .gap_3()
-            .bg(rgb(PANEL))
-            .child(div().flex_1().text_sm().child(message))
-            .child(
-                button("keep-discord-session", "Continuar aqui", false).on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.auto_join.manual();
-                        cx.notify();
-                    },
-                )),
-            );
-        if let Some(call) = destination {
-            row = row.child(
-                button(
-                    "switch-discord-call",
-                    if self.publishing.is_some() {
-                        "Parar e ir para a nova call"
-                    } else {
-                        "Ir para a nova call"
-                    },
-                    true,
                 )
-                .on_click(cx.listener(move |this, _, _, cx| this.connect_call(call.clone(), cx))),
-            );
+                .into_any_element(),
+            )
         } else {
-            row = row.child(
-                button("leave-discord-session", "Sair da sessão", false)
-                    .on_click(cx.listener(|this, _, window, cx| this.leave(window, cx))),
-            );
+            None
         }
-        Some(row.into_any_element())
     }
 
     fn update_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1561,6 +1589,9 @@ impl Focusable for Telinha {
 }
 impl Render for Telinha {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.fullscreen && self.connection != Connection::Connected {
+            self.exit_fullscreen(window, cx);
+        }
         self.app_icon.update(
             self.publishing.is_some() || self.camera_publishing.is_some(),
             window,
@@ -1714,7 +1745,7 @@ impl Render for Telinha {
                 }
                 Connection::Connected => {
                     if !self.fullscreen
-                        && let Some(notice) = self.call_notice(cx)
+                        && let Some(notice) = self.call_notice()
                     {
                         root = root.child(notice);
                     }

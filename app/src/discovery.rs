@@ -20,6 +20,20 @@ impl Default for AutoJoin {
 }
 
 impl AutoJoin {
+    /// Only an authoritative presence response can end a Discord-bound session.
+    /// A gateway outage or HTTP error does not prove that the person left the call.
+    pub fn departed(&self, status: &CallStatus) -> bool {
+        let Some(active) = &self.active else {
+            return false;
+        };
+        match status {
+            CallStatus::Waiting => true,
+            CallStatus::InCall { call } => call.room != active.room,
+            CallStatus::Multiple { calls } => !calls.iter().any(|call| call.room == active.room),
+            CallStatus::Unavailable { .. } => false,
+        }
+    }
+
     pub fn next(&mut self, status: &CallStatus, home: bool, busy: bool) -> Option<DiscordCall> {
         let CallStatus::InCall { call } = status else {
             if matches!(status, CallStatus::Waiting) {
@@ -121,18 +135,36 @@ mod tests {
     }
 
     #[test]
-    fn manual_sessions_and_active_capture_survive_discovery_changes() {
+    fn confirmed_departure_ends_the_bound_session_before_routing_the_new_call() {
         let mut auto = AutoJoin::default();
+        assert!(!auto.departed(&CallStatus::Waiting));
         assert!(auto.next(&call("aaaaaaaaaaaa"), false, false).is_none());
         auto.next(&call("aaaaaaaaaaaa"), true, false).unwrap();
-        assert!(auto.next(&CallStatus::Waiting, false, true).is_none());
-        assert_eq!(auto.active.as_ref().unwrap().room, "aaaaaaaaaaaa");
-        assert!(auto.next(&call("bbbbbbbbbbbb"), false, true).is_none());
-        assert_eq!(auto.active.as_ref().unwrap().room, "aaaaaaaaaaaa");
+        assert!(auto.departed(&CallStatus::Waiting));
+        assert!(auto.departed(&call("bbbbbbbbbbbb")));
+        assert!(!auto.departed(&call("aaaaaaaaaaaa")));
+        assert!(!auto.departed(&CallStatus::Unavailable {
+            reason: CallUnavailable::Connecting,
+        }));
+        // The UI handles departure before checking capture/connection/picker busy state.
+        auto.leave(Some(&call("bbbbbbbbbbbb")));
         assert_eq!(
-            auto.next(&call("bbbbbbbbbbbb"), false, false).unwrap().room,
+            auto.next(&call("bbbbbbbbbbbb"), true, false).unwrap().room,
             "bbbbbbbbbbbb"
         );
+        auto.manual();
+        assert!(!auto.departed(&CallStatus::Waiting));
+    }
+
+    #[test]
+    fn paused_auto_join_still_detects_leaving_and_does_not_enter_the_next_call() {
+        let mut auto = AutoJoin::default();
+        auto.next(&call("aaaaaaaaaaaa"), true, false).unwrap();
+        auto.toggle();
+        let next = call("bbbbbbbbbbbb");
+        assert!(auto.departed(&next));
+        auto.leave(Some(&next));
+        assert!(auto.next(&next, true, false).is_none());
     }
 
     #[test]
@@ -165,5 +197,8 @@ mod tests {
         assert!(auto.next(&status, true, false).is_none());
         auto.enter(first);
         assert_eq!(auto.active.as_ref().unwrap().room, "aaaaaaaaaaaa");
+        assert!(!auto.departed(&status));
+        assert!(auto.departed(&CallStatus::Multiple { calls: vec![] }));
+        assert!(auto.departed(&call("bbbbbbbbbbbb")));
     }
 }

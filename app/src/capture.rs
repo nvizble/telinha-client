@@ -73,6 +73,7 @@ pub fn sources() -> anyhow::Result<Vec<Source>> {
 pub struct Capture {
     pub source: NativeVideoSource,
     pub frames: Arc<AtomicU64>,
+    pub control: crate::adaptive::Control,
     stop: Arc<AtomicBool>,
     output: Arc<parking_lot::Mutex<Option<NativeVideoSource>>>,
 }
@@ -95,7 +96,8 @@ impl Drop for StopOnDrop {
 // Keep the frame pipeline separate so it can also be exercised without screen access.
 struct FramePublisher {
     runtime: tokio::runtime::Handle,
-    quality: Quality,
+    control: crate::adaptive::Control,
+    cadence: crate::adaptive::Cadence,
     source: Option<NativeVideoSource>,
     frames: Arc<AtomicU64>,
     ready: Option<tokio::sync::oneshot::Sender<NativeVideoSource>>,
@@ -105,7 +107,14 @@ struct FramePublisher {
 
 impl FramePublisher {
     fn publish_bgra(&mut self, w: i32, h: i32, stride: u32, data: &[u8]) -> anyhow::Result<()> {
-        let buffer = self.converter.convert(w, h, stride, data, self.quality)?;
+        let started = Instant::now();
+        let profile = self.control.profile();
+        if !self.cadence.accepts(started, profile.fps) {
+            return Ok(());
+        }
+        let buffer =
+            self.converter
+                .convert_to(w, h, stride, data, (profile.width, profile.height))?;
         // NativeVideoSource starts a Tokio keepalive task on its first frame.
         // Enter on the actual callback thread, not only on the spawning thread.
         let _runtime = self.runtime.enter();
@@ -117,6 +126,7 @@ impl FramePublisher {
         let output = self.output.lock().clone().unwrap_or_else(|| native.clone());
         output.capture_frame(&VideoFrame::new(VideoRotation::VideoRotation0, buffer));
         self.frames.fetch_add(1, Ordering::Relaxed);
+        self.control.prepared(width, height, started.elapsed());
         if let Some(tx) = self.ready.take() {
             let _ = tx.send(native.clone());
         }
@@ -144,6 +154,7 @@ impl Capture {
     /// Commit a prepared capture to the existing published track. Preparation
     /// uses a separate source, so canceling never changes what viewers receive.
     pub fn replace(&mut self, previous: &Self) {
+        self.control.preserve_profile(&previous.control);
         previous.stop.store(true, Ordering::Relaxed);
         self.source = previous.source.clone();
         *self.output.lock() = Some(self.source.clone());
@@ -157,6 +168,8 @@ impl Capture {
         let stop = Arc::new(AtomicBool::new(false));
         let mut guard = StopOnDrop(Some(stop.clone()));
         let frames = Arc::new(AtomicU64::new(0));
+        let control = crate::adaptive::Control::new(quality);
+        let thread_control = control.clone();
         let output = Arc::new(parking_lot::Mutex::new(None));
         let thread_output = output.clone();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -188,7 +201,8 @@ impl Capture {
                     let callback_stop = thread_stop.clone();
                     let mut publisher = FramePublisher {
                         runtime,
-                        quality,
+                        control: thread_control.clone(),
+                        cadence: crate::adaptive::Cadence::default(),
                         source: None,
                         frames: thread_frames,
                         ready: Some(ready_tx),
@@ -216,7 +230,6 @@ impl Capture {
                             )
                         });
                     });
-                    let period = Duration::from_secs_f64(1.0 / quality.fps() as f64);
                     #[cfg(target_os = "windows")]
                     let mut checked_window = Instant::now() - Duration::from_secs(1);
                     while !thread_stop.load(Ordering::Relaxed) {
@@ -232,6 +245,8 @@ impl Capture {
                         }
                         let before = Instant::now();
                         capturer.capture_frame();
+                        let period =
+                            Duration::from_secs_f64(1.0 / thread_control.profile().fps as f64);
                         if let Some(wait) = period.checked_sub(before.elapsed()) {
                             std::thread::sleep(wait);
                         }
@@ -256,6 +271,7 @@ impl Capture {
         let capture = Self {
             source,
             frames,
+            control,
             stop,
             output,
         };
@@ -283,7 +299,8 @@ mod tests {
             let frames = Arc::new(AtomicU64::new(0));
             let mut publisher = FramePublisher {
                 runtime: tokio::runtime::Handle::current(),
-                quality: Quality::FullHd30,
+                control: crate::adaptive::Control::new(Quality::FullHd30),
+                cadence: crate::adaptive::Cadence::default(),
                 source: None,
                 frames: frames.clone(),
                 ready: None,
@@ -294,6 +311,7 @@ mod tests {
             let capture = Capture {
                 source: publisher.source.clone().unwrap(),
                 frames,
+                control: publisher.control.clone(),
                 stop: Arc::new(AtomicBool::new(false)),
                 output,
             };
@@ -308,6 +326,7 @@ mod tests {
         let (_, canceled) = prepared();
         drop(canceled);
         assert!(!current.stop.load(Ordering::Relaxed));
+        original.cadence = crate::adaptive::Cadence::default();
         original.publish_bgra(32, 32, 128, &[255; 4096]).unwrap();
         assert!(
             tokio::time::timeout(Duration::from_secs(2), frames.next())
@@ -319,6 +338,7 @@ mod tests {
         replacement.replace(&current);
         assert!(current.stop.load(Ordering::Relaxed));
         drop(current);
+        next.cadence = crate::adaptive::Cadence::default();
         let red: Vec<u8> = [0, 0, 255, 255].into_iter().cycle().take(4096).collect();
         next.publish_bgra(32, 32, 128, &red).unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -344,12 +364,65 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolution_changes_keep_the_original_video_track_and_ultrawide_ratio() {
+        use futures_util::StreamExt;
+        use livekit::{
+            track::LocalVideoTrack,
+            webrtc::{video_source::RtcVideoSource, video_stream::native::NativeVideoStream},
+        };
+        let mut publisher = FramePublisher {
+            runtime: tokio::runtime::Handle::current(),
+            control: crate::adaptive::Control::new(Quality::FullHd60),
+            cadence: crate::adaptive::Cadence::default(),
+            source: None,
+            frames: Arc::default(),
+            ready: None,
+            converter: convert::Converter::default(),
+            output: Arc::default(),
+        };
+        let pixels = vec![255; 3440 * 1440 * 4];
+        publisher
+            .publish_bgra(3440, 1440, 3440 * 4, &pixels)
+            .unwrap();
+        let track = LocalVideoTrack::create_video_track(
+            "Adaptive synthetic ultrawide",
+            RtcVideoSource::Native(publisher.source.clone().unwrap()),
+        );
+        let mut frames = NativeVideoStream::new(track.rtc_track());
+        // The same callback reads its controller on every frame. Change its
+        // profile without replacing the NativeVideoSource or track.
+        // libwebrtc aligns delivered dimensions to four pixels; I420 preparation
+        // only needs two, so the prepared heights 534/802 become 532/800 here.
+        for (quality, expected) in [
+            (Quality::Hd60, (1280, 532)),
+            (Quality::FullHd60, (1920, 800)),
+        ] {
+            publisher.control = crate::adaptive::Control::new(quality);
+            publisher.cadence = crate::adaptive::Cadence::default();
+            publisher
+                .publish_bgra(3440, 1440, 3440 * 4, &pixels)
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while let Some(frame) = frames.next().await {
+                    if (frame.buffer.width(), frame.buffer.height()) == expected {
+                        return;
+                    }
+                }
+                panic!("The original track ended while adapting resolution");
+            })
+            .await
+            .expect("The original video track must receive adapted dimensions");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn first_capture_frame_on_native_thread_initializes_livekit() {
         let frames = Arc::new(AtomicU64::new(0));
         let (ready, received) = tokio::sync::oneshot::channel();
         let mut publisher = FramePublisher {
             runtime: tokio::runtime::Handle::current(),
-            quality: Quality::FullHd30,
+            control: crate::adaptive::Control::new(Quality::FullHd30),
+            cadence: crate::adaptive::Cadence::default(),
             source: None,
             frames: frames.clone(),
             ready: Some(ready),
@@ -363,6 +436,7 @@ mod tests {
             publisher
                 .publish_bgra(321, 181, 1312, &vec![255; 1312 * 181])
                 .unwrap();
+            publisher.cadence = crate::adaptive::Cadence::default();
             publisher
                 .publish_bgra(320, 180, 1280, &vec![255; 1280 * 180])
                 .unwrap();

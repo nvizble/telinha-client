@@ -26,9 +26,9 @@ fn owner(window_id: u64) -> Option<u32> {
 
 /// Kept on the capture worker until WASAPI stops. A PID alone cannot detect exit
 /// or prove that a later process is the one the person selected.
-struct Process {
+pub(super) struct Process {
     handle: HANDLE,
-    created_at: u64,
+    pub(super) created_at: u64,
 }
 
 impl Drop for Process {
@@ -40,7 +40,7 @@ impl Drop for Process {
 }
 
 impl Process {
-    fn open(process_id: u32) -> anyhow::Result<Self> {
+    pub(super) fn open(process_id: u32) -> anyhow::Result<Self> {
         let handle = unsafe {
             OpenProcess(
                 PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
@@ -68,7 +68,7 @@ impl Process {
         Ok(process)
     }
 
-    fn check_alive(&self) -> anyhow::Result<()> {
+    pub(super) fn check_alive(&self) -> anyhow::Result<()> {
         match unsafe { WaitForSingleObject(self.handle, 0) } {
             WAIT_TIMEOUT => Ok(()),
             WAIT_OBJECT_0 => bail!(ENDED),
@@ -78,7 +78,7 @@ impl Process {
         }
     }
 
-    fn check_audio_allowed(&self) -> anyhow::Result<()> {
+    pub(super) fn check_audio_allowed(&self) -> anyhow::Result<()> {
         let mut path = vec![0u16; 32768];
         let mut length = path.len() as u32;
         unsafe {

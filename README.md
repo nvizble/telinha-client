@@ -98,6 +98,10 @@ A autenticação das chaves e a lista de membros dependem da API de admissão. N
 
 **Trocar tela** preserva a sessão e a webcam. No Windows, compartilhar um monitor pede a fonte de áudio explicitamente; Discord e Telinha não são fontes permitidas. Se o Discord estiver em uma aba, escolha o jogo como fonte: captura por processo não separa abas de navegador.
 
+A qualidade da tela se adapta em segundo plano. 1080p60, 1080p30 e 720p60 são limites máximos, sem modo Automático selecionável. O app reduz cadência e dimensões quando há sobrecarga ou limitação de rede, preserva a proporção ultrawide e recupera a qualidade gradualmente. O bitrate continua sendo controlado pelo WebRTC. As mudanças conservam a mesma faixa cifrada; adaptação independente por espectador e da webcam ainda não estão implementadas.
+
+No Windows, **Desktop** mistura o áudio dos aplicativos com sessões de saída, incluindo programas abertos depois de começar a transmissão. Discord nativo, suas variantes e Telinha ficam excluídos; árvores sobrepostas não duplicam o volume. Não captura microfone, sons de sistema sem processo associado ou aplicativos protegidos/inacessíveis, nem faz fallback para áudio global sem filtros. Discord em uma aba não pode ser separado do mesmo navegador: use **Outro app** e escolha o jogo. **Da janela**, **Outro app** e **Sem áudio** continuam disponíveis. O Mac mantém captura de vídeo e reprodução de áudio recebido.
+
 **Ver minha tela** abre uma prévia local opcional, sem reprodução de áudio, a partir da captura já em andamento. Ela começa desligada, limita a prévia a 720p e 10 fps e não altera o áudio enviado aos outros participantes. O ícone fica laranja enquanto tela ou webcam estão publicadas. Em tela cheia, logo e nome desaparecem após cinco segundos de inatividade.
 
 O cliente envia os dados necessários para entrar na sessão, autenticar a conta
@@ -142,3 +146,9 @@ O histórico público começa com um snapshot do cliente. `SOURCE.json` identifi
 a versão e os hashes dos arquivos desse snapshot. Novas versões são sincronizadas
 pela manutenção do Telinha. Relatos de bugs são bem-vindos nas Issues; neste
 momento, não estamos solicitando contribuições de código sob uma licença aberta.
+
+## Galeria, destaque e call
+
+Galeria reúne telas e webcams; clique em um vídeo para destacá-lo e use ampliar para tela cheia. A própria tela aparece sem áudio. O áudio remoto segue apenas a transmissão escolhida; destacar uma webcam mantém essa escolha. Miniaturas limitam dimensão e cadência, sem filas de quadros. A seleção por participante sobrevive a republicações e reconexões.
+
+Sair de uma call do Discord encerra a sessão vinculada, tela e webcam, mesmo durante captura ou conexão. A entrada automática pode acompanhar a nova call. Falhas temporárias de descoberta não contam como saída confirmada. Sessões abertas manualmente por link/código continuam independentes.

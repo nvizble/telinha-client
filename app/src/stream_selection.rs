@@ -5,6 +5,7 @@ use crate::session::{RemoteStream, VideoKind};
 pub struct Selection {
     participant: Option<String>,
     track: Option<String>,
+    kind: Option<VideoKind>,
 }
 
 impl Selection {
@@ -19,10 +20,12 @@ impl Selection {
     pub fn choose(&mut self, stream: Option<&RemoteStream>) {
         self.participant = stream.map(|s| s.participant.clone());
         self.track = stream.map(|s| s.id.clone());
+        self.kind = stream.map(|s| s.kind);
     }
 
     pub fn added(&mut self, stream: &RemoteStream) -> bool {
-        if stream.kind != VideoKind::Screen
+        if stream.kind != self.kind.unwrap_or(VideoKind::Screen)
+            || self.track.as_ref().is_some_and(|track| track != &stream.id)
             || self
                 .participant
                 .as_ref()
@@ -33,6 +36,29 @@ impl Selection {
         let changed = self.track.as_deref() != Some(&stream.id);
         self.choose(Some(stream));
         changed
+    }
+
+    /// A replacement may be subscribed before the old track is removed. Recover
+    /// only a unique track from the chosen owner/kind, never another broadcaster.
+    pub fn recover<'a>(
+        &mut self,
+        streams: impl IntoIterator<Item = &'a RemoteStream>,
+        removed: &str,
+    ) {
+        if self.track.is_some() || self.participant.is_none() {
+            return;
+        }
+        let candidates: Vec<_> = streams
+            .into_iter()
+            .filter(|stream| {
+                stream.id != removed
+                    && self.participant.as_ref() == Some(&stream.participant)
+                    && self.kind == Some(stream.kind)
+            })
+            .collect();
+        if let [stream] = candidates.as_slice() {
+            self.choose(Some(stream));
+        }
     }
 
     pub fn removed(&mut self, track: &str) -> bool {
@@ -100,6 +126,47 @@ mod tests {
         selection.choose(None);
         assert_eq!(selection.participant(), None);
         assert!(selection.added(&screen("b1", "bob")));
+        assert_eq!(selection.track(), Some("b1"));
+    }
+
+    #[test]
+    fn an_explicit_camera_focus_follows_only_that_person_and_media_kind() {
+        let mut focused = Selection::default();
+        let mut camera = screen("cam-a1", "alice");
+        camera.kind = VideoKind::Camera;
+        assert!(!focused.added(&camera));
+        focused.choose(Some(&camera));
+        assert!(focused.removed("cam-a1"));
+        assert!(!focused.added(&screen("screen-a", "alice")));
+        let mut other = camera.clone();
+        other.id = "cam-b".into();
+        other.participant = "bob".into();
+        assert!(!focused.added(&other));
+        assert_eq!(focused.track(), None);
+        camera.id = "cam-a2".into();
+        assert!(focused.added(&camera));
+        assert_eq!(focused.track(), Some("cam-a2"));
+        assert!(!focused.removed("cam-a1"));
+        focused.choose(None);
+        assert!(!focused.added(&camera));
+    }
+
+    #[test]
+    fn an_overlapping_subscription_does_not_replace_a_live_choice() {
+        let mut selection = Selection::default();
+        selection.choose(Some(&screen("a1", "alice")));
+        assert!(!selection.added(&screen("a2", "alice")));
+        assert_eq!(selection.track(), Some("a1"));
+        assert!(selection.removed("a1"));
+        let streams = [
+            screen("a1", "alice"),
+            screen("b1", "bob"),
+            screen("a2", "alice"),
+        ];
+        selection.recover(&streams, "a1");
+        assert_eq!(selection.track(), Some("a2"));
+        selection.choose(Some(&screen("b1", "bob")));
+        selection.recover(&streams, "a2");
         assert_eq!(selection.track(), Some("b1"));
     }
 }
